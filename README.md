@@ -1,21 +1,23 @@
-kchak22-degree-project-gad-healthcare
+# kchak22-degree-project-gad-healthcare
 
 This repository contains the code for a degree project focused on detecting anomalies in healthcare claims data using bipartite graphs with node attributes. The framework implements a variety of anomaly detection techniques—from simple baselines to advanced graph neural network models—along with utilities for data loading, anomaly injection, evaluation, training, and interactive visualization.
-📋 Overview
+
+## 📋 Overview
 
 The project is centered on detecting anomalies in a healthcare setting by modeling claims data as a bipartite graph between providers and members. Key components include:
 
-    Data Handling & Preprocessing: Load and preprocess healthcare data from pickle files.
-    Anomaly Injection: Inject different types of anomalies (structural, feature-based, and healthcare-specific) into the graph with detailed tracking.
-    Models: Implementations range from non-graph (e.g., MLP autoencoder, Isolation Forest, PCA) to graph-based methods (e.g., GCN, GAT, GraphSAGE) and a custom Bipartite Graph Autoencoder tailored for the problem.
-    Evaluation: Tools for computing metrics such as ROC AUC, Average Precision, and for plotting precision-recall curves and anomaly score distributions.
-    Visualization: Interactive visualizations of the graph and anomaly scores.
-    Notebooks: Jupyter notebooks for graph visualization and model comparison.
+- **Data Handling & Preprocessing**: Load and preprocess healthcare data from pickle files.
+- **Anomaly Injection**: Inject different types of anomalies (structural, feature-based, and healthcare-specific) into the graph with detailed tracking.
+- **Models**: Implementations range from non-graph (e.g., MLP autoencoder, Isolation Forest, PCA) to graph-based methods (e.g., GCN, GAT, GraphSAGE) and a custom Bipartite Graph Autoencoder tailored for the problem.
+- **Evaluation**: Tools for computing metrics such as ROC AUC, Average Precision, and for plotting precision-recall curves and anomaly score distributions.
+- **Visualization**: Interactive visualizations of the graph and anomaly scores.
+- **Notebooks**: Jupyter notebooks for graph visualization and model comparison.
 
-🔧 Installation
+## 🔧 Installation
 
 Clone the repository and install the dependencies:
 
+```bash
 # Clone the repository
 git clone https://github.com/yourusername/kchak22-degree-project-gad-healthcare.git
 cd kchak22-degree-project-gad-healthcare
@@ -105,7 +107,7 @@ kchak22-degree-project-gad-healthcare/
 │   │   └── metrics.py
 │   ├── models/                # Model implementations
 │   │   ├── __init__.py
-│   │   ├── baseline_models.py # Baseline and non-graph models
+│   │   ├── baseline_models.py # Baseline models and non-graph approaches
 │   │   └── main_model.py      # Bipartite Graph Autoencoder and custom layers
 │   └── utils/                 # Utility functions for training and visualization
 │       ├── __init__.py
