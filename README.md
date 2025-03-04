@@ -28,66 +28,71 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+```
 
-Requirements
+### Requirements
 
-    Python 3.7+
-    PyTorch 1.9+
-    PyTorch Geometric (>=2.0.0)
-    PyTorch Lightning (>=1.5.0)
-    scikit-learn
-    pandas
-    numpy
-    matplotlib
-    jupyter
-    networkx
-    tqdm
+- Python 3.7+
+- PyTorch 1.9+
+- PyTorch Geometric (>=2.0.0)
+- PyTorch Lightning (>=1.5.0)
+- scikit-learn
+- pandas
+- numpy
+- matplotlib
+- jupyter
+- networkx
+- tqdm
 
-🚀 Quick Start
+## 🚀 Quick Start
 
-    Prepare Your Data
-    Place your data files (e.g., final_df.pickle, final_members_df.pickle, df_descriptions.pickle) in a folder (e.g., a data/ directory located outside or alongside the repository). The data loading functions in src/data/dataloader.py expect paths like ../../data/final_df.pickle.
+### Prepare Your Data
+Place your data files (e.g., `final_df.pickle`, `final_members_df.pickle`, `df_descriptions.pickle`) in a folder (e.g., a `data/` directory located outside or alongside the repository). The data loading functions in `src/data/dataloader.py` expect paths like `../../data/final_df.pickle`.
 
-    Explore Notebooks
-    Use the provided notebooks to visualize graphs and compare models:
-        Graph Visualization & Anomalies
-        Model Comparison
+### Explore Notebooks
+Use the provided notebooks to visualize graphs and compare models:
+- Graph Visualization & Anomalies
+- Model Comparison
 
-    Launch Jupyter Notebook:
-
+Launch Jupyter Notebook:
+```bash
 jupyter notebook notebooks/model_comparison.ipynb
+```
 
-Train a Model
+### Train a Model
 Below is an example of loading data, preparing the graph, and training the custom Bipartite Graph Autoencoder:
 
-    from src.data.dataloader import load_member_features, load_provider_features, load_claims_data, prepare_hetero_data
-    from src.models.main_model import BipartiteGraphAutoEncoder
-    from src.utils.train_utils import train_model
+```python
+from src.data.dataloader import load_member_features, load_provider_features, load_claims_data, prepare_hetero_data
+from src.models.main_model import BipartiteGraphAutoEncoder
+from src.utils.train_utils import train_model
 
-    # Load data (ensure file paths are correct)
-    df_member_features, members_dataset = load_member_features("../../data/final_members_df.pickle")
-    df_provider_features, providers_dataset = load_provider_features("../../data/final_df.pickle")
-    df_edges = load_claims_data("../../data/df_descriptions.pickle", members_dataset, providers_dataset)
+# Load data (ensure file paths are correct)
+df_member_features, members_dataset = load_member_features("../../data/final_members_df.pickle")
+df_provider_features, providers_dataset = load_provider_features("../../data/final_df.pickle")
+df_edges = load_claims_data("../../data/df_descriptions.pickle", members_dataset, providers_dataset)
 
-    # Prepare the HeteroData graph
-    data = prepare_hetero_data(df_member_features, df_provider_features, df_edges)
+# Prepare the HeteroData graph
+data = prepare_hetero_data(df_member_features, df_provider_features, df_edges)
 
-    # Initialize and train the Bipartite Graph Autoencoder
-    model = BipartiteGraphAutoEncoder(
-        in_dim_member=data['member'].x.size(1),
-        in_dim_provider=data['provider'].x.size(1),
-        edge_dim=1,
-        hidden_dim_member=64,
-        hidden_dim_provider=64,
-        out_dim=32,
-        num_layers=2,
-        dropout=0.5
-    )
+# Initialize and train the Bipartite Graph Autoencoder
+model = BipartiteGraphAutoEncoder(
+    in_dim_member=data['member'].x.size(1),
+    in_dim_provider=data['provider'].x.size(1),
+    edge_dim=1,
+    hidden_dim_member=64,
+    hidden_dim_provider=64,
+    out_dim=32,
+    num_layers=2,
+    dropout=0.5
+)
 
-    train_model(model, data, num_epochs=100)
+train_model(model, data, num_epochs=100)
+```
 
-💻 Project Structure
+## 💻 Project Structure
 
+```
 kchak22-degree-project-gad-healthcare/
 ├── requirements.txt           # Project dependencies
 ├── setup.py                   # Package setup (if needed)
@@ -116,62 +121,69 @@ kchak22-degree-project-gad-healthcare/
 │       └── vizualize.py       # Graph and anomaly visualization tools
 └── tests/                     # Unit tests
     └── __init__.py
+```
 
-📚 Implemented Models
-Non-Graph Methods
+## 📚 Implemented Models
 
-    MLP Autoencoder: A simple autoencoder operating solely on node attributes.
-    Sklearn Baselines: Isolation Forest, One-Class SVM, and PCA-based anomaly detection.
+### Non-Graph Methods
+- MLP Autoencoder: A simple autoencoder operating solely on node attributes.
+- Sklearn Baselines: Isolation Forest, One-Class SVM, and PCA-based anomaly detection.
 
-Graph-Based Methods
+### Graph-Based Methods
+- GCN Autoencoder: Uses Graph Convolutional Networks for feature reconstruction.
+- GAT Autoencoder: Leverages attention mechanisms.
+- GraphSAGE Autoencoder: Aggregates neighborhood information using GraphSAGE.
+- Bipartite Graph Autoencoder (Custom): A specialized model that uses bipartite attention layers and is designed for heterogeneous graphs with node attributes.
 
-    GCN Autoencoder: Uses Graph Convolutional Networks for feature reconstruction.
-    GAT Autoencoder: Leverages attention mechanisms.
-    GraphSAGE Autoencoder: Aggregates neighborhood information using GraphSAGE.
-    Bipartite Graph Autoencoder (Custom): A specialized model that uses bipartite attention layers and is designed for heterogeneous graphs with node attributes.
-
-📊 Evaluation
+## 📊 Evaluation
 
 Anomaly detection models are evaluated using:
+- ROC AUC (Area Under the ROC Curve)
+- Average Precision (AP)
+- Precision-Recall Curves
+- Anomaly Score Distributions
 
-    ROC AUC (Area Under the ROC Curve)
-    Average Precision (AP)
-    Precision-Recall Curves
-    Anomaly Score Distributions
+Evaluation routines are available in `src/evaluation/metrics.py` and `src/utils/eval_utils.py`.
 
-Evaluation routines are available in src/evaluation/metrics.py and src/utils/eval_utils.py.
-🛠️ Customization
-Extending the Framework
+## 🛠️ Customization
 
-    Adding New Models:
-    Create a new model class in the src/models/ directory (or extend the baseline models in baseline_models.py) by implementing the forward() and compute_anomaly_scores() methods. Update the notebooks for comparison if needed.
+### Extending the Framework
 
-    Data and Anomaly Injection:
-    The data loading functions and anomaly injection methods (with tracking) are found in src/data/dataloader.py and src/data/anomaly_injection.py. To use your own data, modify these functions or update the file paths accordingly.
+#### Adding New Models
+Create a new model class in the `src/models/` directory (or extend the baseline models in `baseline_models.py`) by implementing the `forward()` and `compute_anomaly_scores()` methods. Update the notebooks for comparison if needed.
 
-    Visualizations and Evaluation:
-    Customize evaluation metrics, ROC/PR curves, and graph visualizations via the scripts in src/utils/.
+#### Data and Anomaly Injection
+The data loading functions and anomaly injection methods (with tracking) are found in `src/data/dataloader.py` and `src/data/anomaly_injection.py`. To use your own data, modify these functions or update the file paths accordingly.
 
-👥 Contributors
+#### Visualizations and Evaluation
+Customize evaluation metrics, ROC/PR curves, and graph visualizations via the scripts in `src/utils/`.
 
-    Karim Chakroun (@kchak22)
+## 👥 Contributors
 
-🤝 Contributing
+- Karim Chakroun (@kchak22)
+
+## 🤝 Contributing
 
 Contributions are welcome! To contribute:
 
-    Fork the repository.
-    Create a feature branch:
-    git checkout -b feature/your-feature
-    Commit your changes:
-    git commit -m "Add some feature"
-    Push to the branch:
-    git push origin feature/your-feature
-    Open a Pull Request.
+1. Fork the repository.
+2. Create a feature branch:
+   ```bash
+   git checkout -b feature/your-feature
+   ```
+3. Commit your changes:
+   ```bash
+   git commit -m "Add some feature"
+   ```
+4. Push to the branch:
+   ```bash
+   git push origin feature/your-feature
+   ```
+5. Open a Pull Request.
 
-📬 Contact
+## 📬 Contact
 
 For questions or feedback, please open an issue or contact:
 
-    Karim Chakroun
-    Email: chakroun@kth.se, karimchakroun2212@yahoo.fr
+- Karim Chakroun
+- Email: chakroun@kth.se, karimchakroun2212@yahoo.fr
