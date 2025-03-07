@@ -177,8 +177,6 @@ def inject_structural_anomalies(data, percentage=0.03, anomaly_types=None):
     
     return modified_data, {'member': member_gt_labels, 'provider': provider_gt_labels}
 
-
-
 def inject_feature_anomalies(data, percentage=0.05, anomaly_types=None):
     """
     Inject feature-based anomalies:
@@ -307,7 +305,6 @@ def inject_feature_anomalies(data, percentage=0.05, anomaly_types=None):
     provider_gt_labels[list(provider_anomaly_indices)] = 1
     
     return modified_data, {'member': member_gt_labels, 'provider': provider_gt_labels}
-
 
 def inject_mixed_anomalies(data, percentages=None, methods=None):
     """
