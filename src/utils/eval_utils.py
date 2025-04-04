@@ -1,201 +1,162 @@
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, f1_score
+import numpy as np
 import torch
-import torch.nn.functional as F 
+from src.utils.train_utils import *
+from torch_geometric.data import HeteroData
+import torch.nn as nn
+from torch_geometric.utils import to_dense_batch, to_undirected
+from torch_geometric.utils import negative_sampling
+from torch_geometric.utils import add_self_loops
+from torch_geometric.utils import remove_self_loops
 
-def evaluate_anomaly_detection(model, data, gt_labels_dict):
-    """Evaluate anomaly detection performance."""
-    # For PyTorch models, set evaluation mode
-    if hasattr(model, 'eval'):
-        model.eval()
-    
-    with torch.no_grad():
-        # Get anomaly scores
-        if hasattr(model, 'compute_anomaly_scores'):
-            scores = model.compute_anomaly_scores(data)
-        else:
-            x_hat_member, x_hat_provider, _ = model(data)
-            
-            # Calculate reconstruction errors
-            member_scores = F.mse_loss(x_hat_member, data['member'].x, reduction='none').sum(dim=1)
-            provider_scores = F.mse_loss(x_hat_provider, data['provider'].x, reduction='none').sum(dim=1)
-            
-            scores = {
-                'member': member_scores,
-                'provider': provider_scores
-            }
-    
-    # Calculate metrics
+@torch.no_grad()
+def evaluate_model_performance(
+    model: nn.Module,
+    eval_data: HeteroData, # Data split (val or test) with edge_labels (y)
+    train_data_struct: HeteroData, # Data providing the graph structure for message passing
+    gt_node_labels: dict, # Ground truth node labels (0/1) from injection
+    # gt_edge_labels: dict, # Ground truth edge labels (0/1) - Now expected in eval_data[type].y
+    lambda_attr: float = 1.0,
+    lambda_struct: float = 0.5,
+    target_edge_types_eval: list = [('provider', 'to', 'member'), ('member', 'to', 'provider')], # Edges to eval
+    k_list=[50, 100, 200]
+    ):
+    """
+    Evaluates the trained model on both node and edge anomaly detection.
+
+    Args:
+        model: The trained model instance.
+        eval_data: HeteroData for the split (val/test) containing edge labels in .y attribute.
+        train_data_struct: HeteroData used for training (provides graph structure for inference).
+        gt_node_labels: Dictionary of ground truth NODE anomaly labels.
+        lambda_attr: Weight for attribute term in NODE anomaly score.
+        lambda_struct: Weight for structural term in NODE anomaly score.
+        target_edge_types_eval: List of edge types to evaluate for edge anomalies.
+        k_list: List of K values for P@K, R@K (for nodes).
+
+    Returns:
+        node_results (dict): Metrics for each node type.
+        edge_results (dict): Metrics for each evaluated edge type.
+        node_scores (dict): Raw anomaly scores for nodes.
+        edge_scores (dict): Raw anomaly logits/scores for edges.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    train_data_struct = train_data_struct.to(device)
+    eval_data = eval_data.to(device) # Need eval data on device for edge labels/indices
+    gt_node_labels_dev = {k: v.to(device) for k, v in gt_node_labels.items()}
+
+    print("Running forward pass for evaluation...")
+    # Forward pass on training graph structure
+    x_hat_m, x_hat_p, z_m, z_p = model(train_data_struct)
+    x_hat_dict = {'member': x_hat_m, 'provider': x_hat_p}
+    x_dict = {'member': train_data_struct['member'].x, 'provider': train_data_struct['provider'].x}
+    z_dict = {'member': z_m, 'provider': z_p}
+
+    # --- Node Evaluation ---
+    print("Calculating NODE anomaly scores...")
+    # For node scoring, use edges present in the *evaluation* split's structure
+    # This reflects the edges connected to nodes in that split. Use edge labels from eval_data.y
+    node_score_edge_indices = {}
+    node_score_edge_labels = {}
+    for edge_type in eval_data.edge_types: # Use edges present in the split being evaluated
+         if hasattr(eval_data[edge_type], 'edge_index') and hasattr(eval_data[edge_type], 'y'):
+              node_score_edge_indices[edge_type] = eval_data[edge_type].edge_index
+              node_score_edge_labels[edge_type] = eval_data[edge_type].y # Labels from injection
+
+    node_scores = calculate_node_anomaly_scores_v2(
+        x_hat_dict, x_dict, z_dict,
+        node_score_edge_indices, # Edges present in the eval split
+        node_score_edge_labels,  # Their corresponding labels
+        model, lambda_attr, lambda_struct
+    )
+
+    print("Computing NODE metrics...")
+    node_results = {}
+    # Provider Node Metrics
+    if 'provider' in node_scores and 'provider' in gt_node_labels_dev:
+        scores_p = node_scores['provider'].cpu().numpy()
+        labels_p = gt_node_labels_dev['provider'].cpu().numpy()
+        node_results['provider'] = compute_evaluation_metrics(scores_p, labels_p, k_list)
+    else: node_results['provider'] = {}
+    # Member Node Metrics
+    if 'member' in node_scores and 'member' in gt_node_labels_dev:
+        scores_m = node_scores['member'].cpu().numpy()
+        labels_m = gt_node_labels_dev['member'].cpu().numpy()
+        node_results['member'] = compute_evaluation_metrics(scores_m, labels_m, k_list)
+    else: node_results['member'] = {}
+
+    # --- Edge Evaluation ---
+    print("Calculating EDGE anomaly scores/logits...")
+    edge_scores = {}
+    edge_results = {}
+    for edge_type in target_edge_types_eval:
+        if edge_type not in eval_data.edge_types:
+            print(f"  Skipping edge type {edge_type} for eval (not in data split).")
+            continue
+        if not hasattr(eval_data[edge_type], 'y') or not hasattr(eval_data[edge_type], 'edge_index'):
+            print(f"  Skipping edge type {edge_type} for eval (missing labels 'y' or 'edge_index').")
+            continue
+
+        edge_index_eval = eval_data[edge_type].edge_index
+        edge_labels_eval = eval_data[edge_type].y.cpu().numpy() # Ground truth for these edges
+
+        if edge_index_eval.numel() == 0:
+             print(f"  Skipping edge type {edge_type} (no edges).")
+             continue
+
+        # Calculate structural logits for these specific edges
+        edge_logits_eval = model.decode_structure(z_dict, edge_index_eval)
+        edge_scores_eval = edge_logits_eval.cpu().numpy() # Use logits as anomaly score (higher = more likely normal)
+                                                         # Or use 1-sigmoid(logits) if higher score should mean anomalous
+        edge_scores[edge_type] = edge_scores_eval
+
+        print(f"  Computing EDGE metrics for {edge_type}...")
+        print(f"    Edges: {len(edge_scores_eval)}, Anomalies: {int(np.sum(edge_labels_eval))}")
+        # Note: compute_evaluation_metrics expects higher score = higher anomaly likelihood
+        # Our logits are higher = more likely *normal*. So we negate logits for metrics.
+        edge_results[edge_type] = compute_evaluation_metrics(-edge_scores_eval, edge_labels_eval, k_list=[]) # Don't need P@K for edges usually
+
+
+    return node_results, edge_results, node_scores, edge_scores
+
+@torch.no_grad()
+def evaluate_model_with_scores(model, data_split, train_data_struct, gt_labels,
+                               lambda_attr=1.0, lambda_struct=0.5,
+                               target_edge_type=('provider', 'to', 'member'),
+                               k_list=[50, 100, 200]):
+    model.eval()
+    device = next(model.parameters()).device
+    train_data_struct = train_data_struct.to(device)
+    gt_labels_dev = {k: v.to(device) for k, v in gt_labels.items()}
+
+    x_hat_m, x_hat_p, z_m, z_p = model(train_data_struct) # Forward pass on train structure
+    x_hat_dict = {'member': x_hat_m, 'provider': x_hat_p}
+    x_dict = {'member': train_data_struct['member'].x, 'provider': train_data_struct['provider'].x}
+    z_dict = {'member': z_m, 'provider': z_p}
+
+    pos_edge_index_struct = train_data_struct[target_edge_type].edge_index
+    anomaly_scores_dict = calculate_node_anomaly_scores(
+        x_hat_dict, x_dict, z_dict,
+        pos_edge_index_struct, model, lambda_attr, lambda_struct
+    )
+
     results = {}
-    for node_type, gt_labels in gt_labels_dict.items():
-        if node_type not in scores:
-            continue
-            
-        y_true = gt_labels.cpu().numpy()
-        y_score = scores[node_type].cpu().numpy()
-        
-        auc = roc_auc_score(y_true, y_score)
-        ap = average_precision_score(y_true, y_score)
-        
-        results[node_type] = {
-            'auc': auc,
-            'ap': ap,
-            'scores': y_score,
-            'labels': y_true
-        }
-    
-    return results
+    # Provider eval
+    if 'provider' in anomaly_scores_dict and 'provider' in gt_labels:
+        scores_p = anomaly_scores_dict['provider'].cpu().numpy()
+        labels_p = gt_labels_dev['provider'].cpu().numpy()
+        if len(scores_p) > 0: results['provider'] = compute_evaluation_metrics(scores_p, labels_p, k_list)
+        else: results['provider'] = {}
+    else: results['provider'] = {}
+    # Member eval
+    if 'member' in anomaly_scores_dict and 'member' in gt_labels:
+        scores_m = anomaly_scores_dict['member'].cpu().numpy()
+        labels_m = gt_labels_dev['member'].cpu().numpy()
+        if len(scores_m) > 0: results['member'] = compute_evaluation_metrics(scores_m, labels_m, k_list)
+        else: results['member'] = {}
+    else: results['member'] = {}
 
-
-def plot_precision_recall_curves(results_dict, model_names, node_type='member'):
-    """Plot precision-recall curves for multiple models."""
-    plt.figure(figsize=(10, 8))
-    
-    for model_name in model_names:
-        if model_name not in results_dict:
-            continue
-            
-        model_results = results_dict[model_name]
-        if node_type not in model_results:
-            continue
-            
-        y_true = model_results[node_type]['labels']
-        y_score = model_results[node_type]['scores']
-        
-        precision, recall, _ = precision_recall_curve(y_true, y_score)
-        ap = model_results[node_type]['ap']
-        
-        plt.plot(recall, precision, lw=2, label=f'{model_name} (AP = {ap:.3f})')
-    
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title(f'Precision-Recall Curves ({node_type}s)')
-    plt.legend(loc="best")
-    plt.grid(True)
-    plt.show()
-
-def plot_anomaly_distribution(results_dict, model_names, node_type='member'):
-    """Plot distribution of anomaly scores for normal and anomalous nodes."""
-    plt.figure(figsize=(15, 10))
-    
-    for i, model_name in enumerate(model_names):
-        if model_name not in results_dict:
-            continue
-            
-        model_results = results_dict[model_name]
-        if node_type not in model_results:
-            continue
-            
-        plt.subplot(len(model_names), 1, i+1)
-        
-        scores = model_results[node_type]['scores']
-        labels = model_results[node_type]['labels']
-        
-        normal_scores = scores[labels == 0]
-        anomaly_scores = scores[labels == 1]
-        
-        plt.hist(normal_scores, bins=50, alpha=0.5, label='Normal', density=True)
-        plt.hist(anomaly_scores, bins=50, alpha=0.5, label='Anomalous', density=True)
-        
-        plt.title(f'{model_name}')
-        plt.xlabel('Anomaly Score')
-        plt.ylabel('Density')
-        plt.legend()
-    
-    plt.tight_layout()
-    plt.show()
-
-def compare_models(results_dict, model_names):
-    """Compare model performance metrics in a table format."""
-    rows = []
-    
-    # Collect results for each model
-    for model_name in model_names:
-        if model_name not in results_dict:
-            continue
-            
-        model_results = results_dict[model_name]
-        
-        # Calculate average metrics across node types
-        avg_auc = 0
-        avg_ap = 0
-        count = 0
-        
-        for node_type in ['member', 'provider']:
-            if node_type in model_results:
-                avg_auc += model_results[node_type]['auc']
-                avg_ap += model_results[node_type]['ap']
-                count += 1
-        
-        if count > 0:
-            avg_auc /= count
-            avg_ap /= count
-        
-        # Add results row
-        row = {
-            'Model': model_name,
-        }
-        
-        for node_type in ['member', 'provider']:
-            if node_type in model_results:
-                row[f'{node_type.capitalize()} AUC'] = model_results[node_type]['auc']
-                row[f'{node_type.capitalize()} AP'] = model_results[node_type]['ap']
-            else:
-                row[f'{node_type.capitalize()} AUC'] = 'N/A'
-                row[f'{node_type.capitalize()} AP'] = 'N/A'
-        
-        row['Avg AUC'] = avg_auc
-        row['Avg AP'] = avg_ap
-        
-        rows.append(row)
-    
-    # Convert to DataFrame for nice display
-    results_df = pd.DataFrame(rows)
-    
-    # Sort by average AUC (descending)
-    results_df = results_df.sort_values('Avg AUC', ascending=False)
-    
-    return results_df
-
-
-def evaluate_model_with_complex_anomalies(model, data, gt_labels_dict, methods=['structural', 'feature']):
-    """Evaluate model performance on different types of anomalies separately."""
-    
-    # Store original data
-    original_data = data.clone()
-    results_by_method = {}
-    
-    for method in methods:
-        print(f"\nEvaluating on {method} anomalies...")
-        
-        # Inject only this type of anomaly
-        if method == 'structural':
-            modified_data, method_gt_labels = inject_structural_anomalies(original_data, percentage=0.03)
-        elif method == 'feature':
-            modified_data, method_gt_labels = inject_feature_anomalies(original_data, percentage=0.04)
-        elif method == 'healthcare':
-            modified_data, method_gt_labels = inject_healthcare_fraud_patterns(
-                original_data, df_provider_features, df_member_features, percentage=0.03
-            )
-        else:
-            continue
-        
-        # Evaluate model on this specific type of anomaly
-        results = evaluate_anomaly_detection(model, modified_data, method_gt_labels)
-        results_by_method[method] = results
-        
-        # Print results
-        for node_type in results:
-            print(f"{node_type} - AUC: {results[node_type]['auc']:.4f}, AP: {results[node_type]['ap']:.4f}")
-    
-    # Overall evaluation with mixed anomalies
-    print("\nEvaluating on mixed anomalies...")
-    mixed_results = evaluate_anomaly_detection(model, data, gt_labels_dict)
-    results_by_method['mixed'] = mixed_results
-    
-    for node_type in mixed_results:
-        print(f"{node_type} - AUC: {mixed_results[node_type]['auc']:.4f}, AP: {mixed_results[node_type]['ap']:.4f}")
-    
-    return results_by_method
+    # Return both metrics and the raw scores for plotting
+    return results, anomaly_scores_dict
