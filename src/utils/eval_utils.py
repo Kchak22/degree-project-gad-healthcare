@@ -1,14 +1,11 @@
-import pandas as pd
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, f1_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 import numpy as np
 import torch
-from src.utils.train_utils import *
 from torch_geometric.data import HeteroData
 import torch.nn as nn
-from torch_geometric.utils import to_dense_batch, to_undirected
-from torch_geometric.utils import negative_sampling
-from torch_geometric.utils import add_self_loops
-from torch_geometric.utils import remove_self_loops
+from torch_scatter import scatter_add, scatter_mean
+from src.utils.train_utils import calculate_node_anomaly_scores
+import torch.nn.functional as F
 
 @torch.no_grad()
 def evaluate_model_performance(
@@ -160,3 +157,164 @@ def evaluate_model_with_scores(model, data_split, train_data_struct, gt_labels,
 
     # Return both metrics and the raw scores for plotting
     return results, anomaly_scores_dict
+
+def compute_evaluation_metrics(scores, labels, k_list=[10, 50, 100]):
+    """
+    Computes AUROC, AP, Precision@K, Recall@K, and Best F1 for given scores and labels.
+
+    Args:
+        scores (np.array): Anomaly scores for nodes.
+        labels (np.array): Ground truth labels (0=normal, 1=anomaly).
+        k_list (list): List of K values for Precision/Recall@K.
+
+    Returns:
+        dict: Dictionary containing computed metrics.
+    """
+    metrics = {}
+
+    # Ensure there are both positive and negative samples for metrics like AUC/AP
+    if len(np.unique(labels)) < 2:
+        print("Warning: Only one class present in labels. AUC/AP metrics cannot be computed.")
+        metrics['AUROC'] = 0.0
+        metrics['AP'] = 0.0
+    else:
+        metrics['AUROC'] = roc_auc_score(labels, scores)
+        metrics['AP'] = average_precision_score(labels, scores) # AP is equivalent to AUPRC
+
+    # Calculate Precision@K, Recall@K
+    # Sort scores and labels
+    desc_score_indices = np.argsort(scores, kind="mergesort")[::-1]
+    scores = scores[desc_score_indices]
+    labels = labels[desc_score_indices]
+
+    num_anomalies = np.sum(labels)
+
+    if num_anomalies == 0:
+        print("Warning: No true anomalies found in labels. Recall@K and F1 will be 0.")
+        for k in k_list:
+             metrics[f'Precision@{k}'] = 0.0
+             metrics[f'Recall@{k}'] = 0.0
+        metrics['Best F1'] = 0.0
+        metrics['Best F1 Threshold'] = 0.0
+    else:
+        for k in k_list:
+            if len(scores) >= k:
+                top_k_labels = labels[:k]
+                num_anomalies_in_top_k = np.sum(top_k_labels)
+                metrics[f'Precision@{k}'] = num_anomalies_in_top_k / k
+                metrics[f'Recall@{k}'] = num_anomalies_in_top_k / num_anomalies
+            else: # Handle cases where K is larger than the number of nodes
+                metrics[f'Precision@{k}'] = np.sum(labels) / len(labels) if len(labels) > 0 else 0.0
+                metrics[f'Recall@{k}'] = 1.0 if np.sum(labels) > 0 else 0.0
+
+
+        # Calculate best F1 score
+        precision, recall, thresholds = precision_recall_curve(labels, scores)
+        f1_scores = 2 * recall * precision / (recall + precision + 1e-8) # Add epsilon for stability
+        best_f1_idx = np.argmax(f1_scores)
+        metrics['Best F1'] = f1_scores[best_f1_idx]
+        # Find the threshold corresponding to the best F1 score
+        # Note: thresholds array is one element shorter than precision/recall
+        metrics['Best F1 Threshold'] = thresholds[min(best_f1_idx, len(thresholds)-1)]
+
+
+    return metrics
+
+
+def calculate_node_anomaly_scores_v2(
+    x_hat_dict: dict, x_dict: dict, z_dict: dict,
+    all_edge_index_dict: dict, # Dict of edge indices per type for structure eval
+    all_edge_label_dict: dict, # Dict of edge labels (0/1) per type
+    model: nn.Module,
+    lambda_attr: float = 1.0, lambda_struct: float = 0.5,
+    target_node_types = ['provider', 'member'],
+    structural_aggregation: str = 'mean' # 'mean' or 'sum'
+    ):
+    """
+    Calculates node-level anomaly scores considering node attribute reconstruction
+    and the structural prediction error of connected edges (using ground truth labels).
+
+    Args:
+        x_hat_dict: Reconstructed node features.
+        x_dict: Original node features.
+        z_dict: Latent node embeddings.
+        all_edge_index_dict: Dict {edge_type: edge_index} for edges to evaluate structurally.
+        all_edge_label_dict: Dict {edge_type: edge_labels} (0/1) for the edges above.
+        model: The trained model instance.
+        lambda_attr: Weight for attribute loss component.
+        lambda_struct: Weight for structure loss component.
+        target_node_types: List of node types to calculate scores for.
+        structural_aggregation: How to aggregate edge errors per node ('mean' or 'sum').
+
+    Returns:
+        Dictionary {node_type: anomaly_scores_tensor}.
+    """
+    anomaly_scores = {}
+    device = next(model.parameters()).device
+
+    # 1. Attribute Reconstruction Error (Node-wise MSE) - Same as before
+    for node_type in target_node_types:
+        if node_type in x_hat_dict and node_type in x_dict:
+            x_hat = x_hat_dict[node_type]
+            x = x_dict[node_type]
+            # Ensure tensors are on the same device before calculation
+            if x_hat.device != x.device: x = x.to(x_hat.device)
+
+            attr_error = torch.sum((x_hat - x)**2, dim=1) # Sum MSE across features
+            anomaly_scores[node_type] = lambda_attr * attr_error
+        else:
+            # Initialize score tensor if only structural error is computed
+             num_nodes = z_dict[node_type].shape[0]
+             anomaly_scores[node_type] = torch.zeros(num_nodes, device=device)
+
+
+    # 2. Structural Reconstruction Error Contribution (Using All Labeled Edges)
+    # Initialize structural error tensors
+    struct_errors = {nt: torch.zeros(z_dict[nt].size(0), device=device) for nt in target_node_types}
+    node_counts = {nt: torch.zeros(z_dict[nt].size(0), device=device) for nt in target_node_types} # For mean aggregation
+
+    for edge_type, edge_index in all_edge_index_dict.items():
+        if edge_index.numel() == 0 or edge_type not in all_edge_label_dict:
+            continue # Skip if no edges or no labels for this type
+
+        edge_labels = all_edge_label_dict[edge_type].to(device).float() # Ensure float for BCE
+
+        # Calculate edge logits using the model's structure decoder
+        edge_logits = model.decode_structure(z_dict, edge_index)
+
+        # Calculate per-edge BCE loss (measures structural prediction error)
+        edge_bce_loss = F.binary_cross_entropy_with_logits(edge_logits, edge_labels, reduction='none')
+
+        # Aggregate this loss to the connected nodes
+        src_node_type, _, dst_node_type = edge_type
+        src_indices, dst_indices = edge_index
+
+        scatter_func = scatter_mean if structural_aggregation == 'mean' else scatter_add
+
+        if src_node_type in target_node_types:
+            # Check if scatter_add or scatter_mean is available
+            if 'scatter_add' in globals() or 'scatter_mean' in globals():
+                struct_errors[src_node_type] = scatter_func(
+                    edge_bce_loss, src_indices, dim=0,
+                    out=struct_errors[src_node_type], # Use out= for in-place add/mean across types
+                    dim_size=struct_errors[src_node_type].size(0)
+                )
+            else: # Fallback or warning if torch_scatter is missing
+                 print(f"Warning: torch_scatter not found, skipping structural error aggregation for {src_node_type} via {edge_type}")
+
+        if dst_node_type in target_node_types:
+             if 'scatter_add' in globals() or 'scatter_mean' in globals():
+                 struct_errors[dst_node_type] = scatter_func(
+                    edge_bce_loss, dst_indices, dim=0,
+                    out=struct_errors[dst_node_type],
+                    dim_size=struct_errors[dst_node_type].size(0)
+                 )
+             else:
+                  print(f"Warning: torch_scatter not found, skipping structural error aggregation for {dst_node_type} via {edge_type}")
+
+
+    # Add structural component to the scores
+    for node_type in target_node_types:
+        anomaly_scores[node_type] += lambda_struct * struct_errors[node_type]
+
+    return anomaly_scores
