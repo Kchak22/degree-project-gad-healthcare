@@ -1,11 +1,16 @@
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
+from collections import defaultdict
+from sklearn.metrics import PrecisionRecallDisplay, roc_auc_score, average_precision_score, precision_recall_curve, f1_score
 import numpy as np
 import torch
 from torch_geometric.data import HeteroData
 import torch.nn as nn
 from torch_scatter import scatter_add, scatter_mean
-from src.utils.train_utils import calculate_node_anomaly_scores
 import torch.nn.functional as F
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, Tuple, Optional, List
+from src.utils.train_utils import *
 
 @torch.no_grad()
 def evaluate_model_performance(
@@ -158,68 +163,6 @@ def evaluate_model_with_scores(model, data_split, train_data_struct, gt_labels,
     # Return both metrics and the raw scores for plotting
     return results, anomaly_scores_dict
 
-def compute_evaluation_metrics(scores, labels, k_list=[10, 50, 100]):
-    """
-    Computes AUROC, AP, Precision@K, Recall@K, and Best F1 for given scores and labels.
-
-    Args:
-        scores (np.array): Anomaly scores for nodes.
-        labels (np.array): Ground truth labels (0=normal, 1=anomaly).
-        k_list (list): List of K values for Precision/Recall@K.
-
-    Returns:
-        dict: Dictionary containing computed metrics.
-    """
-    metrics = {}
-
-    # Ensure there are both positive and negative samples for metrics like AUC/AP
-    if len(np.unique(labels)) < 2:
-        print("Warning: Only one class present in labels. AUC/AP metrics cannot be computed.")
-        metrics['AUROC'] = 0.0
-        metrics['AP'] = 0.0
-    else:
-        metrics['AUROC'] = roc_auc_score(labels, scores)
-        metrics['AP'] = average_precision_score(labels, scores) # AP is equivalent to AUPRC
-
-    # Calculate Precision@K, Recall@K
-    # Sort scores and labels
-    desc_score_indices = np.argsort(scores, kind="mergesort")[::-1]
-    scores = scores[desc_score_indices]
-    labels = labels[desc_score_indices]
-
-    num_anomalies = np.sum(labels)
-
-    if num_anomalies == 0:
-        print("Warning: No true anomalies found in labels. Recall@K and F1 will be 0.")
-        for k in k_list:
-             metrics[f'Precision@{k}'] = 0.0
-             metrics[f'Recall@{k}'] = 0.0
-        metrics['Best F1'] = 0.0
-        metrics['Best F1 Threshold'] = 0.0
-    else:
-        for k in k_list:
-            if len(scores) >= k:
-                top_k_labels = labels[:k]
-                num_anomalies_in_top_k = np.sum(top_k_labels)
-                metrics[f'Precision@{k}'] = num_anomalies_in_top_k / k
-                metrics[f'Recall@{k}'] = num_anomalies_in_top_k / num_anomalies
-            else: # Handle cases where K is larger than the number of nodes
-                metrics[f'Precision@{k}'] = np.sum(labels) / len(labels) if len(labels) > 0 else 0.0
-                metrics[f'Recall@{k}'] = 1.0 if np.sum(labels) > 0 else 0.0
-
-
-        # Calculate best F1 score
-        precision, recall, thresholds = precision_recall_curve(labels, scores)
-        f1_scores = 2 * recall * precision / (recall + precision + 1e-8) # Add epsilon for stability
-        best_f1_idx = np.argmax(f1_scores)
-        metrics['Best F1'] = f1_scores[best_f1_idx]
-        # Find the threshold corresponding to the best F1 score
-        # Note: thresholds array is one element shorter than precision/recall
-        metrics['Best F1 Threshold'] = thresholds[min(best_f1_idx, len(thresholds)-1)]
-
-
-    return metrics
-
 
 def calculate_node_anomaly_scores_v2(
     x_hat_dict: dict, x_dict: dict, z_dict: dict,
@@ -318,3 +261,586 @@ def calculate_node_anomaly_scores_v2(
         anomaly_scores[node_type] += lambda_struct * struct_errors[node_type]
 
     return anomaly_scores
+
+
+
+
+#### New function for inductive setting
+
+
+
+# Keep this helper function as it is - it correctly compares scores and labels
+def compute_evaluation_metrics(scores, labels, k_list=[10, 50, 100]):
+    """
+    Computes AUROC, AP, Precision@K, Recall@K, and Best F1 for given scores and labels.
+    Assumes higher scores indicate higher likelihood of being anomalous.
+
+    Args:
+        scores (np.array): Anomaly scores for nodes or edges.
+        labels (np.array): Ground truth labels (0=normal, 1=anomaly).
+        k_list (list): List of K values for Precision/Recall@K.
+
+    Returns:
+        dict: Dictionary containing computed metrics.
+    """
+    metrics = {}
+    if scores is None or labels is None or len(scores) != len(labels):
+         print(f"Warning: Invalid input for metric computation. Scores len: {len(scores) if scores is not None else 'None'}, Labels len: {len(labels) if labels is not None else 'None'}")
+         return { 'AUROC': 0.0, 'AP': 0.0, 'Best F1': 0.0, 'Best F1 Threshold': 0.0 }
+
+
+    # Ensure there are both positive and negative samples for metrics like AUC/AP
+    if len(np.unique(labels)) < 2:
+        print(f"Warning: Only one class ({np.unique(labels)}) present in labels. AUC/AP/F1 metrics might be ill-defined.")
+        # Handle metrics gracefully for single class
+        metrics['AUROC'] = 0.5 # Chance level
+        metrics['AP'] = np.mean(labels) # If all positive, AP is 1; if all negative, AP is 0. More accurately P(anomaly)
+        metrics['Best F1'] = f1_score(labels, scores > np.median(scores)) # F1 at a threshold
+        metrics['Best F1 Threshold'] = np.median(scores)
+    else:
+        try:
+            metrics['AUROC'] = roc_auc_score(labels, scores)
+            metrics['AP'] = average_precision_score(labels, scores) # AP is equivalent to AUPRC
+        except ValueError as e:
+             print(f"Error calculating AUC/AP: {e}. Setting to 0.")
+             metrics['AUROC'] = 0.0
+             metrics['AP'] = 0.0
+
+
+    # Calculate Precision@K, Recall@K
+    num_items = len(scores)
+    desc_score_indices = np.argsort(scores, kind="mergesort")[::-1]
+    # scores_sorted = scores[desc_score_indices] # Not needed directly
+    labels_sorted = labels[desc_score_indices]
+
+    num_anomalies = np.sum(labels)
+
+    if num_anomalies == 0:
+        # print("Warning: No true anomalies found in labels. Recall@K and F1 will be 0.")
+        for k in k_list:
+             metrics[f'Precision@{k}'] = 0.0
+             metrics[f'Recall@{k}'] = 0.0
+        if 'Best F1' not in metrics: # Avoid overwriting if calculated above
+             metrics['Best F1'] = 0.0
+             metrics['Best F1 Threshold'] = np.max(scores) if len(scores) > 0 else 0.0 # Threshold places everything as normal
+    else:
+        for k in k_list:
+            actual_k = min(k, num_items) # Adjust k if it's larger than the number of items
+            if actual_k > 0:
+                top_k_labels = labels_sorted[:actual_k]
+                num_anomalies_in_top_k = np.sum(top_k_labels)
+                metrics[f'Precision@{k}'] = num_anomalies_in_top_k / actual_k
+                metrics[f'Recall@{k}'] = num_anomalies_in_top_k / num_anomalies
+            else:
+                metrics[f'Precision@{k}'] = 0.0
+                metrics[f'Recall@{k}'] = 0.0
+
+
+        # Calculate best F1 score if not already calculated (for single class case)
+        if 'Best F1' not in metrics and len(np.unique(labels)) > 1:
+            try:
+                precision, recall, thresholds = precision_recall_curve(labels, scores)
+                # Add epsilon to prevent division by zero if precision and recall are both zero
+                f1_scores = 2 * recall * precision / (recall + precision + 1e-8)
+                best_f1_idx = np.argmax(f1_scores)
+                metrics['Best F1'] = f1_scores[best_f1_idx]
+                # Thresholds array can be shorter, handle index carefully
+                metrics['Best F1 Threshold'] = thresholds[min(best_f1_idx, len(thresholds)-1)]
+            except Exception as e: # Catch potential errors during PR curve calculation
+                print(f"Error calculating Best F1: {e}. Setting to 0.")
+                metrics['Best F1'] = 0.0
+                metrics['Best F1 Threshold'] = 0.0
+
+
+    # Ensure all k-metrics are present even if not calculated due to small k or num_anomalies=0
+    for k in k_list:
+        metrics.setdefault(f'Precision@{k}', 0.0)
+        metrics.setdefault(f'Recall@{k}', 0.0)
+    metrics.setdefault('Best F1', 0.0)
+    metrics.setdefault('Best F1 Threshold', 0.0)
+
+
+    return metrics
+
+
+# --- NEW Evaluation Function ---
+def evaluate_performance_inductive(node_scores: dict, edge_scores: dict,
+                                   gt_node_labels_eval: dict, gt_edge_labels_eval: dict,
+                                   k_list: list = [50, 100, 200]):
+    """
+    Evaluates anomaly detection performance using pre-calculated scores
+    against ground truth labels for an evaluation graph (Graph B).
+
+    Args:
+        node_scores: Dictionary {node_type: anomaly_scores_tensor} from calculate_anomaly_scores.
+        edge_scores: Dictionary {edge_type: edge_anomaly_scores_tensor} from calculate_anomaly_scores.
+                     Assumes scores are negated logits (higher = more anomalous).
+        gt_node_labels_eval: Ground truth node labels (0/1) for the evaluation graph.
+        gt_edge_labels_eval: Ground truth edge labels (0/1) for the evaluation graph.
+        k_list: List of K values for P@K, R@K (for nodes).
+
+    Returns:
+        results (dict): A dictionary containing evaluation metrics, structured by node/edge type.
+                       Example: {'nodes': {'provider': {...metrics...}, 'member': {...metrics...}},
+                                 'edges': {('provider','to','member'): {...metrics...}}}
+    """
+    results = {'nodes': {}, 'edges': {}}
+    print("--- Evaluating Performance on Scores ---")
+
+    # Node Evaluation
+    print("Evaluating Node Scores...")
+    for node_type, scores_tensor in node_scores.items():
+        if node_type in gt_node_labels_eval:
+            scores_np = scores_tensor.cpu().numpy()
+            labels_np = gt_node_labels_eval[node_type].cpu().numpy()
+
+            if len(scores_np) != len(labels_np):
+                print(f"Error: Mismatch between scores ({len(scores_np)}) and labels ({len(labels_np)}) for node type {node_type}. Skipping.")
+                results['nodes'][node_type] = {}
+                continue
+
+            print(f"  Node Type: {node_type} - Items: {len(scores_np)}, Anomalies: {int(np.sum(labels_np))}")
+            node_metrics = compute_evaluation_metrics(scores_np, labels_np, k_list)
+            results['nodes'][node_type] = node_metrics
+        else:
+            print(f"Warning: Ground truth node labels not found for type {node_type}. Skipping evaluation.")
+            results['nodes'][node_type] = {}
+
+    # Edge Evaluation
+    print("Evaluating Edge Scores...")
+    for edge_type, scores_np in edge_scores.items():
+        if edge_type in gt_edge_labels_eval:
+            # Scores are already numpy arrays from calculate_anomaly_scores
+            labels_np = gt_edge_labels_eval[edge_type].cpu().numpy()
+
+            if len(scores_np) != len(labels_np):
+                print(f"Error: Mismatch between scores ({len(scores_np)}) and labels ({len(labels_np)}) for edge type {edge_type}. Skipping.")
+                results['edges'][edge_type] = {}
+                continue
+
+            print(f"  Edge Type: {edge_type} - Items: {len(scores_np)}, Anomalies: {int(np.sum(labels_np))}")
+            # Use empty k_list for edges usually, unless P@K/R@K for edges is desired
+            edge_metrics = compute_evaluation_metrics(scores_np, labels_np, k_list=[])
+            results['edges'][str(edge_type)] = edge_metrics # Use string representation for dict key
+        else:
+            print(f"Warning: Ground truth edge labels not found for type {edge_type}. Skipping evaluation.")
+            results['edges'][str(edge_type)] = {}
+
+    print("--- Evaluation Finished ---")
+    return results
+
+# MORE EXTENSIVE EVAL FUNCTION (INDUCTIVE)
+
+
+
+def plot_metric_comparison_bars(summary_df: pd.DataFrame, metrics_to_plot: List[str] = ['AUROC', 'AP', 'Best F1']):
+    """Plots bar charts comparing key metrics across splits and element types."""
+    plot_data = summary_df.set_index(['Split', 'Element'])[metrics_to_plot].unstack('Split')
+    num_metrics = len(metrics_to_plot)
+    if plot_data.empty:
+        print("No data to plot for metric comparison.")
+        return
+
+    fig, axes = plt.subplots(1, num_metrics, figsize=(6 * num_metrics, 5), sharey=True)
+    if num_metrics == 1: axes = [axes] # Ensure axes is iterable
+
+    for i, metric in enumerate(metrics_to_plot):
+        plot_data[metric].plot(kind='bar', ax=axes[i], rot=0)
+        axes[i].set_title(metric)
+        axes[i].set_ylabel("Score")
+        axes[i].grid(axis='y', linestyle='--')
+        axes[i].legend(title="Split")
+        axes[i].set_xlabel("Element Type")
+
+    plt.suptitle("Metric Comparison Across Splits", fontsize=16, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_pr_curves_split(scores_dict: Dict, gt_labels_dict: Dict, split_name: str = 'test'):
+    """Plots PR curves for nodes and edges for a specific split."""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+    fig.suptitle(f"Precision-Recall Curves ({split_name.capitalize()} Set)", fontsize=16)
+    plot_idx = 0
+
+    # Node PR Curves
+    for node_type in ['provider', 'member']: # Specific order
+        ax = axes[plot_idx]
+        node_scores = scores_dict[split_name]['nodes'].get(node_type)
+        node_labels = gt_labels_dict[split_name].get(node_type)
+
+        if node_scores is not None and node_labels is not None and len(node_scores) > 0:
+            scores_np = node_scores.cpu().numpy()
+            labels_np = node_labels.cpu().numpy()
+            if len(np.unique(labels_np)) > 1:
+                ap = average_precision_score(labels_np, scores_np)
+                prec, rec, _ = precision_recall_curve(labels_np, scores_np)
+                pr_display = PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap)
+                pr_display.plot(ax=ax, name=f'{node_type.capitalize()} (AP={ap:.3f})')
+                ax.set_title(f'{node_type.capitalize()} Nodes')
+            else:
+                ax.text(0.5, 0.5, 'Single class\nno PR curve', ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'{node_type.capitalize()} Nodes (Single Class)')
+        else:
+             ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+             ax.set_title(f'{node_type.capitalize()} Nodes (No Data)')
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.grid(True)
+        ax.set_xlim([-0.05, 1.05])
+        ax.set_ylim([-0.05, 1.05])
+        plot_idx += 1
+
+    # Edge PR Curve (assuming only one primary edge type evaluated)
+    ax = axes[plot_idx]
+    edge_type_scores = list(scores_dict[split_name]['edges'].items()) # Get first edge type scored
+    if edge_type_scores:
+        edge_type, edge_scores_np = edge_type_scores[0]
+        edge_type_tuple = eval(edge_type) if isinstance(edge_type, str) else edge_type # Convert back if needed
+        edge_labels = gt_labels_dict[split_name].get(edge_type_tuple)
+
+        if edge_scores_np is not None and edge_labels is not None and len(edge_scores_np) > 0:
+            labels_np = edge_labels.cpu().numpy()
+            if len(np.unique(labels_np)) > 1:
+                ap = average_precision_score(labels_np, edge_scores_np)
+                prec, rec, _ = precision_recall_curve(labels_np, edge_scores_np)
+                pr_display = PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap)
+                pr_display.plot(ax=ax, name=f'Edges (AP={ap:.3f})')
+                ax.set_title(f'Edges: {edge_type}')
+            else:
+                ax.text(0.5, 0.5, 'Single class\nno PR curve', ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'Edges: {edge_type} (Single Class)')
+        else:
+             ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+             ax.set_title(f'Edges: {edge_type} (No Data)')
+
+    else:
+        ax.text(0.5, 0.5, 'No edge data', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('Edges (No Data)')
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.grid(True)
+    ax.set_xlim([-0.05, 1.05])
+    ax.set_ylim([-0.05, 1.05])
+
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+    plt.show()
+
+
+
+def plot_score_distributions_split(scores_dict: Dict, gt_labels_dict: Dict, split_name: str = 'test'):
+    """Plots score distributions (violin plots) for normal vs anomalous."""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle(f"Anomaly Score Distributions ({split_name.capitalize()} Set)", fontsize=16)
+    plot_idx = 0
+
+    elements = []
+    # Node Distributions
+    for node_type in ['provider', 'member']:
+         node_scores = scores_dict[split_name]['nodes'].get(node_type)
+         node_labels = gt_labels_dict[split_name].get(node_type)
+         if node_scores is not None and node_labels is not None and len(node_scores) > 0:
+              elements.append({
+                  'name': f'{node_type.capitalize()} Nodes',
+                  'scores': node_scores.cpu().numpy(),
+                  'labels': node_labels.cpu().numpy()
+              })
+
+    # Edge Distribution
+    edge_type_scores = list(scores_dict[split_name]['edges'].items())
+    if edge_type_scores:
+        edge_type, edge_scores_np = edge_type_scores[0]
+        edge_type_tuple = eval(edge_type) if isinstance(edge_type, str) else edge_type
+        edge_labels = gt_labels_dict[split_name].get(edge_type_tuple)
+        if edge_scores_np is not None and edge_labels is not None and len(edge_scores_np) > 0:
+              elements.append({
+                  'name': f'Edges: {edge_type}',
+                  'scores': edge_scores_np,
+                  'labels': edge_labels.cpu().numpy()
+              })
+
+    # Create plots
+    for i, elem_data in enumerate(elements):
+         if i >= len(axes): break # Should not happen with 3 plots max
+         ax = axes[i]
+         df_plot = pd.DataFrame({'Score': elem_data['scores'], 'Label': elem_data['labels']})
+         df_plot['Anomaly'] = df_plot['Label'].map({0: 'Normal', 1: 'Anomaly'})
+         if df_plot['Label'].nunique() > 0: # Check if there's data
+             sns.violinplot(data=df_plot, x='Anomaly', y='Score', ax=ax, palette='viridis', order=['Normal', 'Anomaly'])
+             ax.set_title(elem_data['name'])
+             ax.grid(axis='y', linestyle='--')
+         else:
+             ax.text(0.5, 0.5, 'No data or\nsingle class', ha='center', va='center', transform=ax.transAxes)
+             ax.set_title(f'{elem_data["name"]} (No Data)')
+         ax.set_xlabel("Status")
+
+
+    # Hide unused axes if fewer than 3 elements plotted
+    for j in range(len(elements), len(axes)):
+         axes[j].set_visible(False)
+
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+
+def plot_anomaly_type_metrics(anomaly_type_df: pd.DataFrame, split_name='test', metrics = ['Mean Score', 'AUROC', 'AP']):
+    """Plots metrics broken down by anomaly type for a specific split."""
+    if anomaly_type_df.empty:
+        print("No data for anomaly type plot.")
+        return
+
+    df_plot = anomaly_type_df[anomaly_type_df['Split'] == split_name].set_index(['Node Type', 'Anomaly Tag'])
+
+    if df_plot.empty:
+        print(f"No anomaly type data found for split '{split_name}'.")
+        return
+
+    num_metrics = len(metrics)
+    fig, axes = plt.subplots(num_metrics, 1, figsize=(12, 5 * num_metrics), sharex=True)
+    if num_metrics == 1: axes = [axes] # Ensure iterable
+
+    unique_tags = anomaly_type_df['Anomaly Tag'].unique()
+    colors = plt.cm.viridis(np.linspace(0, 1, len(unique_tags)))
+    tag_color_map = {tag: color for tag, color in zip(unique_tags, colors)}
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        if metric not in df_plot.columns:
+             ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()}) - No Data")
+             ax.text(0.5, 0.5, 'No Data', ha='center', va='center', transform=ax.transAxes)
+             continue
+
+        # Plot bars grouped by node type
+        df_plot[metric].unstack('Node Type').plot(kind='bar', ax=ax, rot=45) # Group by node type
+
+        ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()})")
+        ax.set_ylabel(metric)
+        ax.set_xlabel("Anomaly Tag")
+        ax.grid(axis='y', linestyle='--')
+        ax.legend(title="Node Type")
+        plt.setp(ax.get_xticklabels(), ha="right") # Improve label rotation visibility
+
+    plt.suptitle(f"Anomaly Type Performance ({split_name.capitalize()} Set)", fontsize=16, y=1.0)
+    plt.tight_layout(rect=[0, 0, 1, 0.98]) # Adjust layout
+    plt.show()
+
+def evaluate_model_inductively(
+    trained_model: nn.Module,
+    train_graph: HeteroData,
+    val_graph: HeteroData,
+    test_graph: HeteroData,
+    gt_node_labels: Dict[str, Dict[str, torch.Tensor]],
+    gt_edge_labels: Dict[str, Dict[Tuple, torch.Tensor]],
+    # --- NEW: Anomaly Tracking Dict ---
+    anomaly_tracking_all: Dict[str, Dict[str, Dict[int, List[str]]]],
+    # --------------------------------
+    device: str = 'mps',
+    eval_params: Optional[Dict] = None,
+    target_edge_type: Tuple = ('provider', 'to', 'member'),
+    plot: bool = True,
+    verbose: bool = True
+    ) -> Tuple[Dict[str, Dict], pd.DataFrame, pd.DataFrame]: # Added 3rd return value
+    """
+    Evaluates a pre-trained model on train, validation, and test graph splits.
+    Calculates self-supervised anomaly scores, computes metrics (overall and per anomaly type),
+    and optionally plots results.
+
+    Args:
+        trained_model: The pre-trained GNN model instance.
+        train_graph: HeteroData object for the training split.
+        val_graph: HeteroData object for the validation split.
+        test_graph: HeteroData object for the testing split.
+        gt_node_labels: Dict mapping split ('train', 'val', 'test') to node label dicts.
+        gt_edge_labels: Dict mapping split ('train', 'val', 'test') to edge label dicts.
+        device: Device to run evaluation on.
+        eval_params (Optional[Dict]): Dictionary containing parameters for evaluation:
+            'k_list' (List[int]): K values for P@K, R@K.
+            'lambda_attr' (float): Weight for attribute score term.
+            'lambda_struct' (float): Weight for structural score term.
+            'k_neg_samples_score' (int): k for negative sampling in structural score calc.
+        target_edge_type (Tuple): Primary edge type for structural scoring.
+        plot (bool): Whether to generate and display plots.
+        verbose (bool): Whether to print progress messages
+        anomaly_tracking_all: Dict mapping split ('train', 'val', 'test') to node anomaly tracking dicts..
+
+    Returns:
+        all_scores (Dict): {'train': score_dict, 'val': score_dict, 'test': score_dict}
+        summary_df (pd.DataFrame): DataFrame containing OVERALL metrics for all splits and types.
+        anomaly_type_df (pd.DataFrame): DataFrame containing metrics broken down by ANOMALY TYPE.
+    """
+    def log(message):
+        if verbose:
+            print(message)
+
+    log("--- Starting Inductive Model Evaluation (with Anomaly Type Analysis) ---")
+
+    # Default eval params if not provided
+    if eval_params is None:
+        eval_params = {
+            'k_list': [50, 100, 200],
+            'lambda_attr': 1.0,
+            'lambda_struct': 0.5,
+            'k_neg_samples_score': 1
+        }
+    k_list = eval_params.get('k_list', [50, 100, 200])
+
+    trained_model.to(device) # Ensure model is on correct device
+    graphs = {'train': train_graph.to(device), 'val': val_graph.to(device), 'test': test_graph.to(device)}
+
+    # --- 1. Scoring ---
+    log("\n--- Scoring Phase ---")
+    all_scores = {}
+    for split_name, graph_data in graphs.items():
+        log(f"Calculating scores for {split_name} split...")
+        # (Score calculation logic remains the same)
+        node_scores, edge_scores = calculate_anomaly_scores(
+            trained_model=trained_model,
+            eval_graph_data=graph_data,
+            lambda_attr=eval_params['lambda_attr'],
+            lambda_struct=eval_params['lambda_struct'],
+            target_edge_type=target_edge_type,
+            k_neg_samples_struct_score=eval_params.get('k_neg_samples_score', 1)
+        )
+        all_scores[split_name] = {'nodes': node_scores, 'edges': edge_scores}
+    log("--- Scoring Complete ---")
+
+    # --- 2. Evaluation & Anomaly Type Analysis ---
+    log("\n--- Evaluation Phase ---")
+    all_metrics = {}
+    per_tag_results = [] # Store detailed results per anomaly tag
+
+    for split_name in ['train', 'val', 'test']:
+        log(f"\nEvaluating performance for {split_name} split...")
+        split_results = {'nodes': {}, 'edges': {}}
+        current_graph = graphs[split_name]
+        current_node_scores = all_scores[split_name]['nodes']
+        current_edge_scores = all_scores[split_name]['edges']
+        current_gt_nodes = gt_node_labels.get(split_name, {})
+        current_gt_edges = gt_edge_labels.get(split_name, {})
+        current_tracking = anomaly_tracking_all.get(split_name, {})
+
+        # --- Overall Node Evaluation ---
+        for node_type, scores_tensor in current_node_scores.items():
+            if node_type in current_gt_nodes:
+                 scores_np = scores_tensor.cpu().numpy()
+                 labels_np = current_gt_nodes[node_type].cpu().numpy()
+                 # Calculate overall metrics for this node type
+                 node_metrics = compute_evaluation_metrics(scores_np, labels_np, k_list)
+                 split_results['nodes'][node_type] = node_metrics
+                 log(f"  Overall Node Metrics ({split_name}, {node_type}): AUROC={node_metrics.get('AUROC', 0):.3f}, AP={node_metrics.get('AP', 0):.3f}")
+
+                 # --- Per Anomaly Type Node Analysis ---
+                 node_type_tracking = current_tracking.get(node_type, {})
+                 if node_type_tracking: # Proceed only if tracking info exists
+                     anomalous_indices = np.where(labels_np == 1)[0]
+                     scores_by_tag = defaultdict(list)
+                     indices_by_tag = defaultdict(list)
+
+                     # Group scores and indices by tag for anomalous nodes
+                     for idx in anomalous_indices:
+                          tags = node_type_tracking.get(int(idx), ['unknown']) # Get tags for this node idx
+                          for tag in tags:
+                              scores_by_tag[tag].append(scores_np[idx])
+                              indices_by_tag[tag].append(idx)
+
+                     log(f"    Analyzing {len(scores_by_tag)} unique anomaly tags for {node_type}...")
+                     # Calculate metrics per tag
+                     for tag, tag_scores_list in scores_by_tag.items():
+                          tag_indices = indices_by_tag[tag]
+                          count = len(tag_scores_list)
+                          mean_score = np.mean(tag_scores_list) if count > 0 else 0
+                          median_score = np.median(tag_scores_list) if count > 0 else 0
+
+                          # Create temporary labels: 1 for nodes with this tag, 0 for normals
+                          temp_labels = np.zeros_like(labels_np)
+                          temp_labels[tag_indices] = 1 # Mark nodes with this tag as positive
+
+                          # Combine scores/labels for nodes with this tag and normal nodes
+                          mask_tag_or_normal = np.logical_or(temp_labels == 1, labels_np == 0)
+                          scores_subset = scores_np[mask_tag_or_normal]
+                          labels_subset = temp_labels[mask_tag_or_normal] # Labels are 1 for tag, 0 for normal
+
+                          # Calculate AUROC/AP for this specific tag vs normals
+                          tag_metrics = compute_evaluation_metrics(scores_subset, labels_subset, k_list=[]) # No K needed here
+
+                          per_tag_results.append({
+                              'Split': split_name,
+                              'Node Type': node_type,
+                              'Anomaly Tag': tag,
+                              'Count': count,
+                              'Mean Score': mean_score,
+                              'Median Score': median_score,
+                              'AUROC': tag_metrics.get('AUROC', 0.0),
+                              'AP': tag_metrics.get('AP', 0.0),
+                              'Best F1': tag_metrics.get('Best F1', 0.0) # F1 for tag vs normal
+                          })
+
+            else: log(f"  Skipping Node Eval ({split_name}, {node_type}): GT Labels Missing")
+
+        # --- Overall Edge Evaluation ---
+        for edge_type, scores_np in current_edge_scores.items():
+             edge_type_tuple = eval(edge_type) if isinstance(edge_type, str) and '(' in edge_type else edge_type
+             if edge_type_tuple in current_gt_edges:
+                  labels_np = current_gt_edges[edge_type_tuple].cpu().numpy()
+                  edge_metrics = compute_evaluation_metrics(scores_np, labels_np, k_list=[])
+                  split_results['edges'][str(edge_type_tuple)] = edge_metrics
+                  log(f"  Overall Edge Metrics ({split_name}, {edge_type_tuple}): AUROC={edge_metrics.get('AUROC', 0):.3f}, AP={edge_metrics.get('AP', 0):.3f}")
+             else: log(f"  Skipping Edge Eval ({split_name}, {edge_type_tuple}): GT Labels Missing")
+
+        all_metrics[split_name] = split_results
+    log("--- Evaluation Complete ---")
+
+    # --- 3. Consolidate Overall Results ---
+    log("\n--- Consolidating Overall Results ---")
+    # (Consolidation logic remains the same as previous function)
+    summary_data = []
+    for split_name, results_data in all_metrics.items():
+        current_graph = graphs[split_name]
+        current_gt_nodes = gt_node_labels.get(split_name, {})
+        current_gt_edges = gt_edge_labels.get(split_name, {})
+        for node_type, metrics in results_data.get('nodes', {}).items():
+            if metrics and node_type in current_graph.node_types:
+                num_items = current_graph[node_type].num_nodes
+                num_anomalies = int(current_gt_nodes.get(node_type, torch.tensor([])).sum().item())
+                perc = (num_anomalies / num_items * 100) if num_items > 0 else 0
+                row = {'Split': split_name, 'Element': f'Node ({node_type})', 'Num Items': num_items, 'Num Anomalies': num_anomalies, '% Anomalies': perc}
+                row.update(metrics); summary_data.append(row)
+        for edge_type_str, metrics in results_data.get('edges', {}).items():
+             try: edge_type = eval(edge_type_str)
+             except: edge_type = edge_type_str
+             if metrics and edge_type in current_graph.edge_types:
+                num_items = current_graph[edge_type].num_edges
+                num_anomalies = int(current_gt_edges.get(edge_type, torch.tensor([])).sum().item())
+                perc = (num_anomalies / num_items * 100) if num_items > 0 else 0
+                row = {'Split': split_name, 'Element': f'Edge {edge_type_str}', 'Num Items': num_items, 'Num Anomalies': num_anomalies, '% Anomalies': perc}
+                row.update(metrics); summary_data.append(row)
+
+    summary_df = pd.DataFrame(summary_data)
+    ordered_cols = ['Split', 'Element', 'Num Items', 'Num Anomalies', '% Anomalies',
+                   'AUROC', 'AP', 'Best F1', 'Best F1 Threshold'] + \
+                   [f'{p}@{k}' for k in k_list for p in ['Precision', 'Recall']]
+    summary_df = summary_df.reindex(columns=ordered_cols, fill_value=np.nan)
+
+    # Create DataFrame for per-tag results
+    anomaly_type_df = pd.DataFrame(per_tag_results)
+    log("--- Results Consolidated ---")
+
+    # --- 4. Plotting (Optional) ---
+    if plot:
+        log("\n--- Generating Plots ---")
+        try:
+            plot_metric_comparison_bars(summary_df)
+            plot_pr_curves_split(all_scores, gt_node_labels, split_name='test')
+            plot_score_distributions_split(all_scores, gt_node_labels, split_name='test')
+            # Plot new anomaly type comparison for test set
+            plot_anomaly_type_metrics(anomaly_type_df, split_name='test')
+
+        except Exception as e:
+            log(f"An error occurred during plotting: {e}")
+
+
+    log("--- Evaluation Function Finished ---")
+    # Return scores, overall summary, and per-type summary
+    return all_scores, summary_df, anomaly_type_df
