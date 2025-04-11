@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, Tuple, Optional, List
 from src.utils.train_utils import *
+import warnings # Import warnings
+
 
 @torch.no_grad()
 def evaluate_model_performance(
@@ -270,10 +272,12 @@ def calculate_node_anomaly_scores_v2(
 
 
 # Keep this helper function as it is - it correctly compares scores and labels
+
 def compute_evaluation_metrics(scores, labels, k_list=[10, 50, 100]):
     """
     Computes AUROC, AP, Precision@K, Recall@K, and Best F1 for given scores and labels.
     Assumes higher scores indicate higher likelihood of being anomalous.
+    ADDED ROBUSTNESS CHECKS.
 
     Args:
         scores (np.array): Anomaly scores for nodes or edges.
@@ -284,45 +288,109 @@ def compute_evaluation_metrics(scores, labels, k_list=[10, 50, 100]):
         dict: Dictionary containing computed metrics.
     """
     metrics = {}
-    if scores is None or labels is None or len(scores) != len(labels):
-         print(f"Warning: Invalid input for metric computation. Scores len: {len(scores) if scores is not None else 'None'}, Labels len: {len(labels) if labels is not None else 'None'}")
-         return { 'AUROC': 0.0, 'AP': 0.0, 'Best F1': 0.0, 'Best F1 Threshold': 0.0 }
+    if scores is None or labels is None or not isinstance(scores, np.ndarray) or not isinstance(labels, np.ndarray):
+        print(f"Warning: Invalid input type for metric computation. Scores type: {type(scores)}, Labels type: {type(labels)}. Returning default metrics.")
+        metrics = { 'AUROC': 0.0, 'AP': 0.0, 'Best F1': 0.0, 'Best F1 Threshold': 0.0 }
+        for k in k_list:
+            metrics[f'Precision@{k}'] = 0.0
+            metrics[f'Recall@{k}'] = 0.0
+        return metrics
+
+    if len(scores) != len(labels):
+        print(f"Warning: Score length ({len(scores)}) != Label length ({len(labels)}). Returning default metrics.")
+        # (Same default return structure as above)
+        metrics = { 'AUROC': 0.0, 'AP': 0.0, 'Best F1': 0.0, 'Best F1 Threshold': 0.0 }
+        for k in k_list:
+            metrics[f'Precision@{k}'] = 0.0
+            metrics[f'Recall@{k}'] = 0.0
+        return metrics
+
+    if len(scores) == 0:
+        # print("Warning: Empty scores/labels array. Returning default metrics.")
+         # (Same default return structure as above)
+        metrics = { 'AUROC': 0.0, 'AP': 0.0, 'Best F1': 0.0, 'Best F1 Threshold': 0.0 }
+        for k in k_list:
+            metrics[f'Precision@{k}'] = 0.0
+            metrics[f'Recall@{k}'] = 0.0
+        return metrics
 
 
-    # Ensure there are both positive and negative samples for metrics like AUC/AP
+    num_anomalies = np.sum(labels)
+    num_items = len(labels)
+
+    # Ensure there are both positive and negative samples for AUC/AP/F1
     if len(np.unique(labels)) < 2:
-        print(f"Warning: Only one class ({np.unique(labels)}) present in labels. AUC/AP/F1 metrics might be ill-defined.")
-        # Handle metrics gracefully for single class
-        metrics['AUROC'] = 0.5 # Chance level
-        metrics['AP'] = np.mean(labels) # If all positive, AP is 1; if all negative, AP is 0. More accurately P(anomaly)
-        metrics['Best F1'] = f1_score(labels, scores > np.median(scores)) # F1 at a threshold
-        metrics['Best F1 Threshold'] = np.median(scores)
+        # print(f"Warning: Only one class ({np.unique(labels)}) present in labels. AUC/AP/F1 metrics are ill-defined.")
+        metrics['AUROC'] = 0.5 # Assign chance level AUC
+        metrics['AP'] = float(num_anomalies > 0) # AP is 1 if all are anomalies, 0 otherwise
+        # Calculate F1 at a basic threshold (e.g., median) for reference
+        try:
+            median_score = np.median(scores)
+            pred_labels = (scores > median_score).astype(int)
+            metrics['Best F1'] = f1_score(labels, pred_labels, zero_division=0)
+            metrics['Best F1 Threshold'] = median_score
+        except Exception: # Catch any error during median/f1 calc
+             metrics['Best F1'] = 0.0
+             metrics['Best F1 Threshold'] = 0.0
     else:
+        # Calculate AUROC and AP within try-except
         try:
             metrics['AUROC'] = roc_auc_score(labels, scores)
-            metrics['AP'] = average_precision_score(labels, scores) # AP is equivalent to AUPRC
         except ValueError as e:
-             print(f"Error calculating AUC/AP: {e}. Setting to 0.")
+            print(f"  Warning: ValueError calculating AUROC: {e}. Setting AUROC to 0.0.")
+            metrics['AUROC'] = 0.0
+        except Exception as e:
+             print(f"  Warning: Unexpected error calculating AUROC: {e}. Setting AUROC to 0.0.")
              metrics['AUROC'] = 0.0
-             metrics['AP'] = 0.0
+
+        try:
+            metrics['AP'] = average_precision_score(labels, scores)
+        except ValueError as e:
+            print(f"  Warning: ValueError calculating AP: {e}. Setting AP to 0.0.")
+            metrics['AP'] = 0.0
+        except Exception as e:
+            print(f"  Warning: Unexpected error calculating AP: {e}. Setting AP to 0.0.")
+            metrics['AP'] = 0.0
+
+        # Calculate Best F1 using Precision-Recall curve
+        try:
+            # Use warnings context manager to suppress potential UndefinedMetricWarning if needed
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore") # Ignore warnings during curve calculation
+                precision, recall, thresholds = precision_recall_curve(labels, scores)
+
+            # Handle cases where precision or recall might be zero length or cause division issues
+            f1_scores = np.divide(2 * recall * precision, recall + precision, out=np.zeros_like(recall), where=(recall + precision) > 0)
+
+            if len(f1_scores) > 0:
+                best_f1_idx = np.argmax(f1_scores)
+                metrics['Best F1'] = f1_scores[best_f1_idx]
+                # Ensure threshold index is valid
+                metrics['Best F1 Threshold'] = thresholds[min(best_f1_idx, len(thresholds) - 1)] if len(thresholds) > 0 else np.median(scores)
+            else:
+                # Fallback if f1_scores array is empty
+                metrics['Best F1'] = 0.0
+                metrics['Best F1 Threshold'] = np.median(scores)
+
+        except Exception as e:
+            print(f"  Warning: Error calculating Best F1 from PR curve: {e}. Setting Best F1 to 0.0.")
+            metrics['Best F1'] = 0.0
+            metrics['Best F1 Threshold'] = np.median(scores) # Use median as a fallback threshold
 
 
     # Calculate Precision@K, Recall@K
-    num_items = len(scores)
+    # Sort scores in descending order to get top K
+    # Use stable sort if scores might have ties (mergesort is stable)
     desc_score_indices = np.argsort(scores, kind="mergesort")[::-1]
-    # scores_sorted = scores[desc_score_indices] # Not needed directly
     labels_sorted = labels[desc_score_indices]
-
-    num_anomalies = np.sum(labels)
 
     if num_anomalies == 0:
         # print("Warning: No true anomalies found in labels. Recall@K and F1 will be 0.")
+        metrics['Best F1'] = 0.0 # Ensure F1 is 0 if no anomalies
+        metrics['Best F1 Threshold'] = np.max(scores) if num_items > 0 else 0.0 # Threshold places everything as normal
         for k in k_list:
-             metrics[f'Precision@{k}'] = 0.0
-             metrics[f'Recall@{k}'] = 0.0
-        if 'Best F1' not in metrics: # Avoid overwriting if calculated above
-             metrics['Best F1'] = 0.0
-             metrics['Best F1 Threshold'] = np.max(scores) if len(scores) > 0 else 0.0 # Threshold places everything as normal
+            metrics[f'Precision@{k}'] = 0.0
+            metrics[f'Recall@{k}'] = 0.0
     else:
         for k in k_list:
             actual_k = min(k, num_items) # Adjust k if it's larger than the number of items
@@ -335,30 +403,14 @@ def compute_evaluation_metrics(scores, labels, k_list=[10, 50, 100]):
                 metrics[f'Precision@{k}'] = 0.0
                 metrics[f'Recall@{k}'] = 0.0
 
-
-        # Calculate best F1 score if not already calculated (for single class case)
-        if 'Best F1' not in metrics and len(np.unique(labels)) > 1:
-            try:
-                precision, recall, thresholds = precision_recall_curve(labels, scores)
-                # Add epsilon to prevent division by zero if precision and recall are both zero
-                f1_scores = 2 * recall * precision / (recall + precision + 1e-8)
-                best_f1_idx = np.argmax(f1_scores)
-                metrics['Best F1'] = f1_scores[best_f1_idx]
-                # Thresholds array can be shorter, handle index carefully
-                metrics['Best F1 Threshold'] = thresholds[min(best_f1_idx, len(thresholds)-1)]
-            except Exception as e: # Catch potential errors during PR curve calculation
-                print(f"Error calculating Best F1: {e}. Setting to 0.")
-                metrics['Best F1'] = 0.0
-                metrics['Best F1 Threshold'] = 0.0
-
-
-    # Ensure all k-metrics are present even if not calculated due to small k or num_anomalies=0
+    # Ensure all required keys exist with default values if calculation failed
+    metrics.setdefault('AUROC', 0.0)
+    metrics.setdefault('AP', 0.0)
+    metrics.setdefault('Best F1', 0.0)
+    metrics.setdefault('Best F1 Threshold', np.median(scores) if num_items > 0 else 0.0) # Use median as default threshold if needed
     for k in k_list:
         metrics.setdefault(f'Precision@{k}', 0.0)
         metrics.setdefault(f'Recall@{k}', 0.0)
-    metrics.setdefault('Best F1', 0.0)
-    metrics.setdefault('Best F1 Threshold', 0.0)
-
 
     return metrics
 
