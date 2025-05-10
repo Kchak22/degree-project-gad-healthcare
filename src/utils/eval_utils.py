@@ -487,6 +487,7 @@ def evaluate_performance_inductive(node_scores: dict, edge_scores: dict,
 
 def plot_metric_comparison_bars(summary_df: pd.DataFrame, metrics_to_plot: List[str] = ['AUROC', 'AP', 'Best F1']):
     """Plots bar charts comparing key metrics across splits and element types."""
+    summary_df['Element'] = summary_df['Element'].str.replace('^Edge.*', 'Edge', regex=True)    
     plot_data = summary_df.set_index(['Split', 'Element'])[metrics_to_plot].unstack('Split')
     num_metrics = len(metrics_to_plot)
     if plot_data.empty:
@@ -509,173 +510,678 @@ def plot_metric_comparison_bars(summary_df: pd.DataFrame, metrics_to_plot: List[
     plt.show()
 
 
-def plot_pr_curves_split(scores_dict: Dict, gt_labels_dict: Dict, split_name: str = 'test'):
-    """Plots PR curves for nodes and edges for a specific split."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-    fig.suptitle(f"Precision-Recall Curves ({split_name.capitalize()} Set)", fontsize=16)
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.metrics import average_precision_score, precision_recall_curve, PrecisionRecallDisplay
+from typing import Dict, Optional, Tuple, List
+import warnings # Added to handle potential single-class warnings gracefully
+
+# Set a visually appealing style
+import seaborn as sns
+#sns.set_theme(style="whitegrid", palette="deep", font_scale=1.1)
+
+def plot_pr_curves_split(
+    scores_dict: Dict,
+    gt_node_labels_dict: Dict, # Separate dict for NODE labels
+    gt_edge_labels_dict: Dict, # Separate dict for EDGE labels
+    split_name: str = 'test',
+    figsize: Tuple[int, int] = (18, 5.5), # Slightly increased height
+    target_edge_type: Optional[Tuple] = ('provider', 'to', 'member') # Specify edge type to plot, if any
+    ):
+    """
+    Plots PR curves for nodes and a specific edge type for a given data split.
+
+    Args:
+        scores_dict: Nested dict {'split': {'nodes': {type: scores}, 'edges': {type: scores}}}.
+                     Edge scores should be anomaly scores (higher = more anomalous).
+        gt_node_labels_dict: Nested dict {'split': {type: labels}}.
+        gt_edge_labels_dict: Nested dict {'split': {type_tuple: labels}}.
+        split_name: The name of the split to plot (e.g., 'test', 'val').
+        figsize: Figure size.
+        target_edge_type: The specific edge type tuple to plot PR curve for. If None, edge plot is skipped.
+    """
+    if split_name not in scores_dict:
+        print(f"Error: Split '{split_name}' not found in scores_dict.")
+        return
+    if split_name not in gt_node_labels_dict:
+        print(f"Warning: Split '{split_name}' not found in gt_node_labels_dict. Node plots might be empty.")
+    if split_name not in gt_edge_labels_dict and target_edge_type is not None:
+         print(f"Warning: Split '{split_name}' not found in gt_edge_labels_dict. Edge plot might be empty.")
+
+    split_scores = scores_dict[split_name]
+    split_node_labels = gt_node_labels_dict.get(split_name, {}) # Use .get for safety
+    split_edge_labels = gt_edge_labels_dict.get(split_name, {}) # Use .get for safety
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize, sharey=True)
+    fig.suptitle(f"Precision-Recall Curves ({split_name.capitalize()} Set)", fontsize=16, y=1.02)
     plot_idx = 0
+    line_width = 1.8
+    grid_style = {'linestyle': ':', 'alpha': 0.7}
 
-    # Node PR Curves
-    for node_type in ['provider', 'member']: # Specific order
+    # --- Node PR Curves ---
+    for node_type in ['provider', 'member']:
         ax = axes[plot_idx]
-        node_scores = scores_dict[split_name]['nodes'].get(node_type)
-        node_labels = gt_labels_dict[split_name].get(node_type)
+        node_scores = split_scores.get('nodes', {}).get(node_type)
+        node_labels = split_node_labels.get(node_type) # Get from NODE label dict
 
-        if node_scores is not None and node_labels is not None and len(node_scores) > 0:
-            scores_np = node_scores.cpu().numpy()
-            labels_np = node_labels.cpu().numpy()
-            if len(np.unique(labels_np)) > 1:
-                ap = average_precision_score(labels_np, scores_np)
-                prec, rec, _ = precision_recall_curve(labels_np, scores_np)
-                pr_display = PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap)
-                pr_display.plot(ax=ax, name=f'{node_type.capitalize()} (AP={ap:.3f})')
-                ax.set_title(f'{node_type.capitalize()} Nodes')
+        plot_title = f'{node_type.capitalize()} Nodes'
+        if node_scores is not None and node_labels is not None:
+            # Ensure scores are numpy arrays
+            scores_np = node_scores.cpu().numpy() if hasattr(node_scores, 'cpu') else np.array(node_scores)
+            labels_np = node_labels.cpu().numpy() if hasattr(node_labels, 'cpu') else np.array(node_labels)
+
+            if len(scores_np) == len(labels_np) and len(scores_np) > 0:
+                if len(np.unique(labels_np)) > 1:
+                    try:
+                        ap = average_precision_score(labels_np, scores_np)
+                        prec, rec, _ = precision_recall_curve(labels_np, scores_np)
+                        pr_display = PrecisionRecallDisplay(precision=prec, recall=rec) # Removed average_precision=ap for cleaner plot object
+                        pr_display.plot(ax=ax, name=f'{node_type.capitalize()} (AP={ap:.3f})', linewidth=line_width)
+                        ax.set_title(plot_title)
+                    except Exception as e:
+                         print(f"Error plotting PR curve for {node_type}: {e}")
+                         ax.text(0.5, 0.5, 'Error plotting', ha='center', va='center', transform=ax.transAxes)
+                         ax.set_title(f'{plot_title} (Error)')
+                else:
+                    ax.text(0.5, 0.5, 'Single class\nno PR curve', ha='center', va='center', transform=ax.transAxes)
+                    ax.set_title(f'{plot_title} (Single Class)')
             else:
-                ax.text(0.5, 0.5, 'Single class\nno PR curve', ha='center', va='center', transform=ax.transAxes)
-                ax.set_title(f'{node_type.capitalize()} Nodes (Single Class)')
+                ax.text(0.5, 0.5, 'Data mismatch\nor empty', ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'{plot_title} (Data Error)')
         else:
              ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-             ax.set_title(f'{node_type.capitalize()} Nodes (No Data)')
+             ax.set_title(f'{plot_title} (No Data)')
+
         ax.set_xlabel("Recall")
         ax.set_ylabel("Precision")
-        ax.grid(True)
+        ax.grid(True, **grid_style)
         ax.set_xlim([-0.05, 1.05])
         ax.set_ylim([-0.05, 1.05])
+        ax.legend(loc='lower left')
         plot_idx += 1
 
-    # Edge PR Curve (assuming only one primary edge type evaluated)
+    # --- Edge PR Curve ---
     ax = axes[plot_idx]
-    edge_type_scores = list(scores_dict[split_name]['edges'].items()) # Get first edge type scored
-    if edge_type_scores:
-        edge_type, edge_scores_np = edge_type_scores[0]
-        edge_type_tuple = eval(edge_type) if isinstance(edge_type, str) else edge_type # Convert back if needed
-        edge_labels = gt_labels_dict[split_name].get(edge_type_tuple)
+    plot_title_edge = 'Edges (Not Plotted)' # Default title
+    if target_edge_type:
+        edge_scores = split_scores.get('edges', {}).get(target_edge_type)
+        # *** CORRECTED LABEL ACCESS ***
+        edge_labels = split_edge_labels.get(target_edge_type) # Get from EDGE label dict
+        edge_type_str = str(target_edge_type) # For display
+        plot_title_edge = f'Edges: {edge_type_str}'
 
-        if edge_scores_np is not None and edge_labels is not None and len(edge_scores_np) > 0:
-            labels_np = edge_labels.cpu().numpy()
-            if len(np.unique(labels_np)) > 1:
-                ap = average_precision_score(labels_np, edge_scores_np)
-                prec, rec, _ = precision_recall_curve(labels_np, edge_scores_np)
-                pr_display = PrecisionRecallDisplay(precision=prec, recall=rec, average_precision=ap)
-                pr_display.plot(ax=ax, name=f'Edges (AP={ap:.3f})')
-                ax.set_title(f'Edges: {edge_type}')
+        if edge_scores is not None and edge_labels is not None:
+            scores_np = edge_scores.cpu().numpy() if hasattr(edge_scores, 'cpu') else np.array(edge_scores)
+            labels_np = edge_labels.cpu().numpy() if hasattr(edge_labels, 'cpu') else np.array(edge_labels)
+
+            # IMPORTANT: Ensure higher score means MORE anomalous for PR curve
+            # If your edge scores are negated logits (lower=more anomalous), negate them back or use 1-sigmoid(logits)
+            # Assuming edge_scores ARE anomaly scores (higher = more anomalous)
+            # If they are logits (higher = normal), use `-scores_np` in AP/PR calculations.
+
+            if len(scores_np) == len(labels_np) and len(scores_np) > 0:
+                if len(np.unique(labels_np)) > 1:
+                    try:
+                        # Use -scores_np if scores represent normality likelihood (like logits)
+                        # Use scores_np if they represent anomaly likelihood (like negated logits)
+                        ap = average_precision_score(labels_np, scores_np) # Assuming higher score = anomalous
+                        prec, rec, _ = precision_recall_curve(labels_np, scores_np) # Assuming higher score = anomalous
+                        pr_display = PrecisionRecallDisplay(precision=prec, recall=rec)
+                        pr_display.plot(ax=ax, name=f'Edges (AP={ap:.3f})', linewidth=line_width)
+                        ax.set_title(plot_title_edge)
+                    except Exception as e:
+                         print(f"Error plotting PR curve for edges {edge_type_str}: {e}")
+                         ax.text(0.5, 0.5, 'Error plotting', ha='center', va='center', transform=ax.transAxes)
+                         ax.set_title(f'{plot_title_edge} (Error)')
+
+                else:
+                    ax.text(0.5, 0.5, 'Single class\nno PR curve', ha='center', va='center', transform=ax.transAxes)
+                    ax.set_title(f'{plot_title_edge} (Single Class)')
             else:
-                ax.text(0.5, 0.5, 'Single class\nno PR curve', ha='center', va='center', transform=ax.transAxes)
-                ax.set_title(f'Edges: {edge_type} (Single Class)')
+                 ax.text(0.5, 0.5, 'Data mismatch\nor empty', ha='center', va='center', transform=ax.transAxes)
+                 ax.set_title(f'{plot_title_edge} (Data Error)')
         else:
-             ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-             ax.set_title(f'Edges: {edge_type} (No Data)')
-
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{plot_title_edge} (No Data)')
     else:
-        ax.text(0.5, 0.5, 'No edge data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('Edges (No Data)')
+         ax.text(0.5, 0.5, 'No target edge type\nspecified', ha='center', va='center', transform=ax.transAxes)
+         ax.set_title('Edges (Not Plotted)')
+
+
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.grid(True)
+    ax.grid(True, **grid_style)
     ax.set_xlim([-0.05, 1.05])
     ax.set_ylim([-0.05, 1.05])
+    ax.legend(loc='lower left')
 
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.show()
 
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from typing import Dict, Optional, Tuple, List
 
-def plot_score_distributions_split(scores_dict: Dict, gt_labels_dict: Dict, split_name: str = 'test'):
-    """Plots score distributions (violin plots) for normal vs anomalous."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle(f"Anomaly Score Distributions ({split_name.capitalize()} Set)", fontsize=16)
-    plot_idx = 0
+# Set style (optional, but consistent)
+sns.set_theme(style="whitegrid", palette="viridis", font_scale=1.1) # Using viridis for violin
 
-    elements = []
+def plot_score_distributions_split(
+    scores_dict: Dict,
+    gt_node_labels_dict: Dict, # Separate dict for NODE labels
+    gt_edge_labels_dict: Dict, # Separate dict for EDGE labels
+    split_name: str = 'test',
+    figsize: Tuple[int, int] = (18, 5.5),
+    target_edge_type: Optional[Tuple] = ('provider', 'to', 'member')
+    ):
+    """
+    Plots score distributions (violin plots) for normal vs anomalous nodes and edges.
+
+    Args:
+        scores_dict: Nested dict {'split': {'nodes': {type: scores}, 'edges': {type: scores}}}.
+                     Scores should be anomaly scores (higher = more anomalous).
+        gt_node_labels_dict: Nested dict {'split': {type: labels}}.
+        gt_edge_labels_dict: Nested dict {'split': {type_tuple: labels}}.
+        split_name: The name of the split to plot (e.g., 'test', 'val').
+        figsize: Figure size.
+        target_edge_type: The specific edge type tuple to plot distributions for.
+    """
+    if split_name not in scores_dict:
+        print(f"Error: Split '{split_name}' not found in scores_dict.")
+        return
+    if split_name not in gt_node_labels_dict:
+        print(f"Warning: Split '{split_name}' not found in gt_node_labels_dict. Node plots might be empty.")
+    if split_name not in gt_edge_labels_dict and target_edge_type is not None:
+         print(f"Warning: Split '{split_name}' not found in gt_edge_labels_dict. Edge plot might be empty.")
+
+
+    split_scores = scores_dict[split_name]
+    split_node_labels = gt_node_labels_dict.get(split_name, {})
+    split_edge_labels = gt_edge_labels_dict.get(split_name, {})
+
+    elements_to_plot = []
     # Node Distributions
     for node_type in ['provider', 'member']:
-         node_scores = scores_dict[split_name]['nodes'].get(node_type)
-         node_labels = gt_labels_dict[split_name].get(node_type)
-         if node_scores is not None and node_labels is not None and len(node_scores) > 0:
-              elements.append({
-                  'name': f'{node_type.capitalize()} Nodes',
-                  'scores': node_scores.cpu().numpy(),
-                  'labels': node_labels.cpu().numpy()
-              })
+        node_scores = split_scores.get('nodes', {}).get(node_type)
+        node_labels = split_node_labels.get(node_type)
+        if node_scores is not None and node_labels is not None:
+            scores_np = node_scores.cpu().numpy() if hasattr(node_scores, 'cpu') else np.array(node_scores)
+            labels_np = node_labels.cpu().numpy() if hasattr(node_labels, 'cpu') else np.array(node_labels)
+            if len(scores_np) == len(labels_np) and len(scores_np) > 0:
+                elements_to_plot.append({
+                    'name': f'{node_type.capitalize()} Nodes',
+                    'scores': scores_np,
+                    'labels': labels_np
+                })
 
     # Edge Distribution
-    edge_type_scores = list(scores_dict[split_name]['edges'].items())
-    if edge_type_scores:
-        edge_type, edge_scores_np = edge_type_scores[0]
-        edge_type_tuple = eval(edge_type) if isinstance(edge_type, str) else edge_type
-        edge_labels = gt_labels_dict[split_name].get(edge_type_tuple)
-        if edge_scores_np is not None and edge_labels is not None and len(edge_scores_np) > 0:
-              elements.append({
-                  'name': f'Edges: {edge_type}',
-                  'scores': edge_scores_np,
-                  'labels': edge_labels.cpu().numpy()
-              })
+    if target_edge_type:
+        edge_scores = split_scores.get('edges', {}).get(target_edge_type)
+        # *** CORRECTED LABEL ACCESS ***
+        edge_labels = split_edge_labels.get(target_edge_type)
+        edge_type_str = str(target_edge_type)
+
+        if edge_scores is not None and edge_labels is not None:
+            scores_np = edge_scores.cpu().numpy() if hasattr(edge_scores, 'cpu') else np.array(edge_scores)
+            labels_np = edge_labels.cpu().numpy() if hasattr(edge_labels, 'cpu') else np.array(edge_labels)
+            # Assuming higher scores = more anomalous (like negated logits)
+            if len(scores_np) == len(labels_np) and len(scores_np) > 0:
+                 elements_to_plot.append({
+                    'name': f'Edges',
+                    'scores': scores_np,
+                    'labels': labels_np
+                 })
+
+    num_plots = len(elements_to_plot)
+    if num_plots == 0:
+        print("No valid data found to plot distributions.")
+        return
+
+    fig, axes = plt.subplots(1, num_plots, figsize=figsize) # Adjust columns based on actual data
+    if num_plots == 1: axes = [axes] # Ensure iterable
+    fig.suptitle(f"Anomaly Score Distributions ({split_name.capitalize()} Set)", fontsize=16, y=1.02)
+    grid_style = {'linestyle': ':', 'alpha': 0.7}
 
     # Create plots
-    for i, elem_data in enumerate(elements):
-         if i >= len(axes): break # Should not happen with 3 plots max
+    for i, elem_data in enumerate(elements_to_plot):
          ax = axes[i]
-         df_plot = pd.DataFrame({'Score': elem_data['scores'], 'Label': elem_data['labels']})
-         df_plot['Anomaly'] = df_plot['Label'].map({0: 'Normal', 1: 'Anomaly'})
-         if df_plot['Label'].nunique() > 0: # Check if there's data
-             sns.violinplot(data=df_plot, x='Anomaly', y='Score', ax=ax, palette='viridis', order=['Normal', 'Anomaly'])
-             ax.set_title(elem_data['name'])
-             ax.grid(axis='y', linestyle='--')
+         # Filter out potential NaNs which cause violinplot errors
+         df_plot = pd.DataFrame({'Score': elem_data['scores'], 'Label': elem_data['labels']}).dropna()
+
+         if not df_plot.empty and df_plot['Label'].nunique() > 0:
+             df_plot['Status'] = df_plot['Label'].map({0: 'Normal', 1: 'Anomaly'})
+             plot_order = [status for status in ['Normal', 'Anomaly'] if status in df_plot['Status'].unique()] # Ensure correct order
+
+             if len(plot_order) > 0: # Check if there's actually data to plot after filtering
+                 try:
+                     sns.violinplot(data=df_plot, x='Status', y='Score', ax=ax, order=plot_order, cut=0, inner='quartile', linewidth=1.5) # Added cut=0, inner='quartile'
+                     ax.set_title(elem_data['name'])
+                     ax.grid(axis='y', **grid_style)
+                 except Exception as e:
+                     print(f"Error during violin plot for {elem_data['name']}: {e}")
+                     ax.text(0.5, 0.5, 'Error plotting', ha='center', va='center', transform=ax.transAxes)
+                     ax.set_title(f'{elem_data["name"]} (Plot Error)')
+
+             else: # Data only had NaNs or single class after dropna
+                 ax.text(0.5, 0.5, 'Single class or NaN data', ha='center', va='center', transform=ax.transAxes)
+                 ax.set_title(f'{elem_data["name"]} (Invalid Data)')
          else:
              ax.text(0.5, 0.5, 'No data or\nsingle class', ha='center', va='center', transform=ax.transAxes)
              ax.set_title(f'{elem_data["name"]} (No Data)')
          ax.set_xlabel("Status")
 
 
-    # Hide unused axes if fewer than 3 elements plotted
-    for j in range(len(elements), len(axes)):
-         axes[j].set_visible(False)
+    # Hide unused axes if fewer than 3 elements plotted originally requested 3 axes
+    # for j in range(num_plots, 3):
+    #      if j < len(axes): # Check if axis exists before trying to hide
+    #           axes[j].set_visible(False)
 
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
     plt.show()
 
 
-def plot_anomaly_type_metrics(anomaly_type_df: pd.DataFrame, split_name='test', metrics = ['Mean Score', 'AUROC', 'AP']):
-    """Plots metrics broken down by anomaly type for a specific split."""
-    if anomaly_type_df.empty:
-        print("No data for anomaly type plot.")
+
+def plot_all_score_distributions(
+    scores_dict: Dict[str, Dict], # keys: split_name, values: {'nodes': {type: scores}, 'edges': {type: scores}}
+    gt_node_labels_dict: Dict[str, Dict], # keys: split_name, values: {type: labels}
+    gt_edge_labels_dict: Dict[str, Dict], # keys: split_name, values: {type_tuple: labels}
+    figsize_per_plot: Tuple[int, int] = (6, 5), # Size for EACH individual subplot
+    target_edge_type: Optional[Tuple] = ('provider', 'to', 'member')
+    ):
+    """
+    Plots score distributions (violin plots) for normal vs anomalous nodes and edges
+    across all available data splits (train, val, test).
+
+    Args:
+        scores_dict: Nested dict {'split': {'nodes': {type: scores}, 'edges': {type: scores}}}.
+                     Scores should be anomaly scores (higher = more anomalous).
+        gt_node_labels_dict: Nested dict {'split': {type: labels}}.
+        gt_edge_labels_dict: Nested dict {'split': {type_tuple: labels}}.
+        figsize_per_plot: Approximate figure size allocated per subplot (width, height).
+                          The total figure size will be calculated based on this.
+        target_edge_type: The specific edge type tuple to plot distributions for.
+                          If None, edge column will be skipped.
+    """
+    node_types = ['provider', 'member']
+    element_types_to_plot = node_types + ([str(target_edge_type)] if target_edge_type else []) # Use string for lookup later
+    element_names = ['Provider Nodes', 'Member Nodes'] + (['Edges'] if target_edge_type else [])
+
+    splits_to_plot = sorted([split for split in scores_dict.keys() if split in gt_node_labels_dict or split in gt_edge_labels_dict])
+
+    if not splits_to_plot:
+        print("Error: No valid splits found in scores_dict matching label dicts.")
         return
 
-    df_plot = anomaly_type_df[anomaly_type_df['Split'] == split_name].set_index(['Node Type', 'Anomaly Tag'])
+    num_splits = len(splits_to_plot)
+    num_elements = len(element_types_to_plot)
 
-    if df_plot.empty:
+    if num_elements == 0:
+        print("Error: No element types specified for plotting (check node_types and target_edge_type).")
+        return
+
+    # Calculate total figure size
+    total_figsize = (figsize_per_plot[0] * num_elements, figsize_per_plot[1] * num_splits)
+
+    fig, axes = plt.subplots(num_splits, num_elements, figsize=total_figsize, squeeze=False) # Ensure axes is always 2D
+    fig.suptitle("Anomaly Score Distributions Across Splits", fontsize=18, y=1.03) # Adjust y if needed
+
+    grid_style = {'linestyle': ':', 'alpha': 0.7}
+
+    for i, split_name in enumerate(splits_to_plot):
+        split_scores = scores_dict.get(split_name, {})
+        split_node_labels = gt_node_labels_dict.get(split_name, {})
+        split_edge_labels = gt_edge_labels_dict.get(split_name, {})
+
+        # --- Data Preparation for the current split ---
+        plot_data_for_split = []
+
+        # 1. Node Data
+        for node_type in node_types:
+            scores = split_scores.get('nodes', {}).get(node_type)
+            labels = split_node_labels.get(node_type)
+            plot_data_for_split.append({'type': node_type, 'scores': scores, 'labels': labels})
+
+        # 2. Edge Data
+        if target_edge_type:
+            scores = split_scores.get('edges', {}).get(target_edge_type)
+            labels = split_edge_labels.get(target_edge_type)
+            plot_data_for_split.append({'type': str(target_edge_type), 'scores': scores, 'labels': labels})
+
+
+        # --- Plotting for the current split ---
+        for j, elem_key in enumerate(element_types_to_plot): # Iterate through columns (provider, member, edge)
+            ax = axes[i, j] # Select the correct subplot [row, column]
+            data = next((item for item in plot_data_for_split if item['type'] == elem_key), None)
+            element_name = element_names[j] # Get the display name
+
+            if data and data['scores'] is not None and data['labels'] is not None:
+                scores_np = data['scores'].cpu().numpy() if hasattr(data['scores'], 'cpu') else np.array(data['scores'])
+                labels_np = data['labels'].cpu().numpy() if hasattr(data['labels'], 'cpu') else np.array(data['labels'])
+
+                if len(scores_np) == len(labels_np) and len(scores_np) > 0:
+                    df_plot = pd.DataFrame({'Score': scores_np, 'Label': labels_np}).dropna()
+
+                    if not df_plot.empty and df_plot['Label'].nunique() > 0:
+                        df_plot['Status'] = df_plot['Label'].map({0: 'Normal', 1: 'Anomaly'})
+                        plot_order = [status for status in ['Normal', 'Anomaly'] if status in df_plot['Status'].unique()]
+
+                        if len(plot_order) > 0:
+                            try:
+                                sns.violinplot(data=df_plot, x='Status', y='Score', ax=ax, order=plot_order, cut=0, inner='quartile', linewidth=1.5)
+                                ax.grid(axis='y', **grid_style)
+                            except Exception as e:
+                                print(f"Error during violin plot for {element_name} ({split_name}): {e}")
+                                ax.text(0.5, 0.5, 'Error plotting', ha='center', va='center', transform=ax.transAxes)
+                                ax.set_title(f'{element_name}\n({split_name.capitalize()}) (Plot Error)') # Add split name to title
+                        else:
+                            ax.text(0.5, 0.5, 'Single class or NaN data', ha='center', va='center', transform=ax.transAxes)
+                            ax.set_title(f'{element_name}\n({split_name.capitalize()}) (Invalid Data)')
+                    else:
+                        ax.text(0.5, 0.5, 'No data or\nsingle class', ha='center', va='center', transform=ax.transAxes)
+                        ax.set_title(f'{element_name}\n({split_name.capitalize()}) (No Data)')
+                else:
+                     ax.text(0.5, 0.5, 'Empty data or\nmismatched lengths', ha='center', va='center', transform=ax.transAxes)
+                     ax.set_title(f'{element_name}\n({split_name.capitalize()}) (Input Error)')
+
+            else: # Data was missing for this element/split combination
+                ax.text(0.5, 0.5, 'Data not found', ha='center', va='center', transform=ax.transAxes)
+                ax.set_title(f'{element_name}\n({split_name.capitalize()}) (Missing)')
+
+            # Set titles and labels clearly
+            if not ax.get_title(): # Set title only if not set by error handling
+                 ax.set_title(f'{element_name}\n({split_name.capitalize()})')
+
+            # Clean up labels for clarity (optional - remove inner labels if desired)
+            if i < num_splits - 1: # Not the last row
+                ax.set_xlabel("")
+                ax.set_xticklabels([])
+            else:
+                 ax.set_xlabel("Status")
+
+            if j > 0: # Not the first column
+                ax.set_ylabel("")
+            else:
+                ax.set_ylabel("Score")
+
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # Adjust rect based on suptitle position
+    plt.show()
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from typing import Dict, Tuple, Optional, List
+import os
+
+# Set a visually appealing style
+sns.set_theme(style="whitegrid", palette="deep", font_scale=1.1)
+
+def plot_anomaly_type_metrics_sorted(
+    anomaly_type_df: pd.DataFrame,
+    split_name: str = 'test',
+    metrics: List[str] = ['Mean Score', 'AUROC', 'AP', 'Best F1'],
+    sort_by_metric: str = 'AP', # Metric to sort tags by
+    sort_ascending: bool = True, # True: Hardest first (low AP/AUC), False: Easiest first (high Mean Score)
+    figsize: Tuple[int, int] = (14, 6), # Adjusted default size
+    save_path: Optional[str] = None
+):
+    """
+    Plots metrics broken down by anomaly type for a specific split,
+    sorting the anomaly tags based on a chosen performance metric.
+
+    Args:
+        anomaly_type_df (pd.DataFrame): DataFrame containing per-tag metrics.
+                                        Must include 'Split', 'Node Type', 'Anomaly Tag',
+                                        and the specified metrics.
+        split_name (str): The split to plot (e.g., 'test').
+        metrics (List[str]): List of metric columns to plot.
+        sort_by_metric (str): Metric name used to sort the anomaly tags on the plot.
+        sort_ascending (bool): Sort order for the tags based on the metric.
+                               True (default for AP/AUC/F1) puts worst-performing first.
+                               False (default for Mean Score) puts highest-scoring first.
+        figsize (Tuple[int, int]): Figure size.
+        save_path (Optional[str]): If provided, saves the figure to this path.
+    """
+    if anomaly_type_df.empty:
+        print("No data provided for anomaly type plot.")
+        return
+
+    df_split = anomaly_type_df[anomaly_type_df['Split'] == split_name].copy()
+
+    if df_split.empty:
         print(f"No anomaly type data found for split '{split_name}'.")
         return
 
-    num_metrics = len(metrics)
-    fig, axes = plt.subplots(num_metrics, 1, figsize=(12, 5 * num_metrics), sharex=True)
-    if num_metrics == 1: axes = [axes] # Ensure iterable
+    # --- Sort Anomaly Tags ---
+    if sort_by_metric in df_split.columns:
+        # Calculate the average of the sorting metric across node types for each tag
+        # Use mean, ignore NaN values if a tag doesn't apply to all node types
+        tag_sort_metric = df_split.groupby('Anomaly Tag')[sort_by_metric].mean(numeric_only=True)
 
-    unique_tags = anomaly_type_df['Anomaly Tag'].unique()
-    colors = plt.cm.viridis(np.linspace(0, 1, len(unique_tags)))
-    tag_color_map = {tag: color for tag, color in zip(unique_tags, colors)}
+        # Sort the tags based on the aggregated metric
+        sorted_tags = tag_sort_metric.sort_values(ascending=sort_ascending).index.tolist()
+        print(f"Sorting anomaly tags by '{sort_by_metric}' (ascending={sort_ascending}).")
+    else:
+        print(f"Warning: Metric '{sort_by_metric}' not found for sorting. Using alphabetical tag order.")
+        sorted_tags = sorted(df_split['Anomaly Tag'].dropna().unique())
+
+    # --- Plotting ---
+    num_metrics = len(metrics)
+    # Adjust height based on number of metrics
+    fig, axes = plt.subplots(num_metrics, 1, figsize=(figsize[0], figsize[1] * num_metrics / 2), sharex=True)
+    if num_metrics == 1: axes = [axes]
+
+    grid_style = {'linestyle': ':', 'alpha': 0.7}
 
     for i, metric in enumerate(metrics):
         ax = axes[i]
-        if metric not in df_plot.columns:
-             ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()}) - No Data")
-             ax.text(0.5, 0.5, 'No Data', ha='center', va='center', transform=ax.transAxes)
+        if metric not in df_split.columns:
+             ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()}) - Metric Not Found")
+             ax.text(0.5, 0.5, f"Metric '{metric}'\nNot Found", ha='center', va='center', transform=ax.transAxes)
              continue
 
-        # Plot bars grouped by node type
-        df_plot[metric].unstack('Node Type').plot(kind='bar', ax=ax, rot=45) # Group by node type
+        # Pivot data: Anomaly Tag as index, Node Type as columns
+        try:
+            pivot_df = pd.pivot_table(df_split, index='Anomaly Tag', columns='Node Type', values=metric, aggfunc='mean')
+            # Reindex pivot table rows based on the calculated sort order
+            pivot_df = pivot_df.reindex(sorted_tags).dropna(how='all')
+        except KeyError:
+             ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()}) - Pivot Error")
+             ax.text(0.5, 0.5, f"Column 'Node Type' missing\nor error during pivot.", ha='center', va='center', transform=ax.transAxes)
+             continue
+        except Exception as e:
+            print(f"Error pivoting/reindexing data for metric '{metric}': {e}")
+            ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()}) - Data Error")
+            ax.text(0.5, 0.5, "Error creating plot data", ha='center', va='center', transform=ax.transAxes)
+            continue
+
+        if pivot_df.empty:
+            ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()}) - No Data")
+            ax.text(0.5, 0.5, "No data to plot", ha='center', va='center', transform=ax.transAxes)
+            continue
+
+        # Plotting grouped bars
+        pivot_df.plot(kind='bar', ax=ax, width=0.8, rot=45) # Use default palette, group by Node Type
 
         ax.set_title(f"{metric} per Anomaly Type ({split_name.capitalize()})")
         ax.set_ylabel(metric)
-        ax.set_xlabel("Anomaly Tag")
-        ax.grid(axis='y', linestyle='--')
-        ax.legend(title="Node Type")
-        plt.setp(ax.get_xticklabels(), ha="right") # Improve label rotation visibility
+        ax.grid(axis='y', **grid_style)
+        ax.tick_params(axis='x', labelsize=10)
+        # Adjust x-tick label alignment manually for rotated labels
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
 
-    plt.suptitle(f"Anomaly Type Performance ({split_name.capitalize()} Set)", fontsize=16, y=1.0)
-    plt.tight_layout(rect=[0, 0, 1, 0.98]) # Adjust layout
+
+        ax.legend(title="Node Type", bbox_to_anchor=(1.01, 1), loc='upper left', fontsize='small')
+
+        if i == num_metrics - 1:
+            sort_order_text = "Ascending (Worst First)" if sort_ascending else "Descending (Best First)"
+            if metric == "Mean Score" and not sort_ascending: # Adjust text for Mean Score default
+                sort_order_text = "Descending (Highest Score First)"
+            elif metric != "Mean Score" and sort_ascending:
+                 sort_order_text = "Ascending (Lowest Score First)"
+
+            ax.set_xlabel(f"Anomaly Tag (Sorted by Avg {sort_by_metric}, {sort_order_text})")
+        else:
+            ax.set_xlabel("") # Remove x-label from upper plots
+
+    fig.suptitle(f"Anomaly Type Performance ({split_name.capitalize()} Set)", fontsize=16, y=1.02) # Adjust y slightly
+    plt.tight_layout(rect=[0, 0.02, 0.88, 0.97]) # Adjust right margin more for potentially longer legend
+
+    if save_path:
+        try:
+            save_dir = os.path.dirname(save_path)
+            if save_dir: os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Sorted anomaly type plot saved to {save_path}")
+        except Exception as e:
+            print(f"Error saving sorted anomaly type plot: {e}")
+
+    plt.show()
+
+def plot_grouped_score_distributions(
+    scores_dict: Dict[str, Dict], # keys: split_name ('train', 'val', 'test')
+    gt_node_labels_dict: Dict[str, Dict],
+    gt_edge_labels_dict: Dict[str, Dict],
+    figsize: Tuple[int, int] = (18, 6), # Figure size for the whole row of plots
+    target_edge_type: Optional[Tuple] = ('provider', 'to', 'member')
+    ):
+    """
+    Plots score distributions (violin plots) comparing splits (train, val, test)
+    for each element type (provider nodes, member nodes, edges) side-by-side.
+
+    Args:
+        scores_dict: Nested dict {'split': {'nodes': {type: scores}, 'edges': {type: scores}}}.
+        gt_node_labels_dict: Nested dict {'split': {type: labels}}.
+        gt_edge_labels_dict: Nested dict {'split': {type_tuple: labels}}.
+        figsize: Figure size for the entire figure containing the subplots.
+        target_edge_type: The specific edge type tuple to plot distributions for.
+    """
+    node_types = ['provider', 'member']
+    # Store the actual keys used in dictionaries
+    element_keys_to_plot = node_types + ([target_edge_type] if target_edge_type else [])
+    # User-friendly names for titles
+    element_names = ['Provider Nodes', 'Member Nodes'] + (['Edges'] if target_edge_type else [])
+    splits = ['train', 'val', 'test'] # Define the order for plotting and legend
+
+    num_elements = len(element_keys_to_plot)
+    if num_elements == 0:
+        print("Error: No element types specified for plotting.")
+        return
+
+    fig, axes = plt.subplots(1, num_elements, figsize=figsize, squeeze=False)
+    axes = axes.flatten() # Ensure axes is always a 1D array
+
+    fig.suptitle("Anomaly Score Distributions by Split", fontsize=16, y=1.02)
+    grid_style = {'linestyle': ':', 'alpha': 0.7}
+
+    plot_data_found = False # Flag to check if any data was plotted
+
+    for j, elem_key in enumerate(element_keys_to_plot):
+        ax = axes[j]
+        elem_name = element_names[j]
+
+        # --- Aggregate data across splits for this element type ---
+        all_scores = []
+        all_labels = []
+        all_split_names = []
+
+        is_edge = isinstance(elem_key, tuple) # Differentiate edges (tuple) from nodes (str)
+
+        for split_name in splits:
+            scores = None
+            labels = None
+            # Safely get scores and labels
+            if is_edge:
+                scores = scores_dict.get(split_name, {}).get('edges', {}).get(elem_key)
+                labels = gt_edge_labels_dict.get(split_name, {}).get(elem_key)
+            else: # Node type
+                scores = scores_dict.get(split_name, {}).get('nodes', {}).get(elem_key)
+                labels = gt_node_labels_dict.get(split_name, {}).get(elem_key)
+
+            if scores is not None and labels is not None:
+                scores_np = scores.cpu().numpy() if hasattr(scores, 'cpu') else np.array(scores)
+                labels_np = labels.cpu().numpy() if hasattr(labels, 'cpu') else np.array(labels)
+
+                if len(scores_np) == len(labels_np) and len(scores_np) > 0:
+                    all_scores.extend(scores_np)
+                    all_labels.extend(labels_np)
+                    all_split_names.extend([split_name] * len(scores_np))
+                    plot_data_found = True # Mark that we found some data
+                else:
+                    print(f"Warning: Mismatched lengths or zero length for {elem_name} in split {split_name}")
+            else:
+                 print(f"Warning: Missing data for {elem_name} in split {split_name}")
+
+
+        # --- Create DataFrame for the current element type ---
+        if not all_scores: # No data found for this element type at all
+            ax.text(0.5, 0.5, 'No data available\nfor any split', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{elem_name}\n(No Data)')
+            continue # Skip to the next element plot
+
+        df_element = pd.DataFrame({
+            'Score': all_scores,
+            'Label': all_labels,
+            'Split': all_split_names # Use this column for hue
+        })
+        df_element = df_element.dropna() # Drop rows where score might be NaN etc.
+        df_element['Status'] = df_element['Label'].map({0: 'Normal', 1: 'Anomaly'})
+
+        # --- Check if data is still valid after processing ---
+        if df_element.empty or df_element['Status'].nunique() < 1 or df_element['Split'].nunique() < 1:
+             ax.text(0.5, 0.5, 'Insufficient valid data\nafter processing', ha='center', va='center', transform=ax.transAxes)
+             ax.set_title(f'{elem_name}\n(Invalid Data)')
+             continue
+
+
+        # --- Plot using hue for splits ---
+        try:
+            sns.violinplot(
+                data=df_element,
+                x='Status',        # Normal vs Anomaly
+                y='Score',
+                hue='Split',       # Color by train/val/test
+                ax=ax,
+                order=['Normal', 'Anomaly'], # Ensure consistent x-axis order
+                hue_order=splits,            # Ensure consistent legend/color order
+                split=True,        # Show hues side-by-side within each status
+                cut=0,
+                inner='quartile',
+                linewidth=1.2 # Slightly reduced linewidth for split violins
+            )
+            ax.set_title(elem_name)
+            ax.grid(axis='y', **grid_style)
+            ax.set_xlabel("Status") # Label x-axis on each plot
+            # Remove individual legends if we add a figure legend later
+            if ax.get_legend():
+                 ax.get_legend().remove()
+
+        except Exception as e:
+            print(f"Error during violin plot for {elem_name}: {e}")
+            ax.text(0.5, 0.5, 'Error plotting', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{elem_name}\n(Plot Error)')
+
+
+    # --- Add a single legend for the whole figure ---
+    if plot_data_found: # Only add legend if some data was actually plotted
+        # Get handles and labels from one of the axes that might have them
+        handles, labels = None, None
+        for ax in axes:
+             h, l = ax.get_legend_handles_labels()
+             if h: # Found an axis with legend info
+                 handles, labels = h, l
+                 break # Use the first one found
+        if handles:
+            # Place legend outside the plot area to the right
+            fig.legend(handles, labels, title='Split', bbox_to_anchor=(1.01, 0.5), loc='center left')
+
+
+    # Adjust layout - might need fine-tuning depending on legend size
+    plt.tight_layout(rect=[0, 0.03, 0.98 if plot_data_found and handles else 1, 0.95]) # Leave space for legend if present
     plt.show()
 
 def evaluate_model_inductively(
@@ -747,6 +1253,7 @@ def evaluate_model_inductively(
     for split_name, graph_data in graphs.items():
         log(f"Calculating scores for {split_name} split...")
         # (Score calculation logic remains the same)
+        from src.utils.train_utils import calculate_anomaly_scores
         node_scores, edge_scores = calculate_anomaly_scores(
             trained_model=trained_model,
             eval_graph_data=graph_data,
@@ -772,6 +1279,7 @@ def evaluate_model_inductively(
         current_gt_nodes = gt_node_labels.get(split_name, {})
         current_gt_edges = gt_edge_labels.get(split_name, {})
         current_tracking = anomaly_tracking_all.get(split_name, {})
+        #print("Debug", current_tracking)
 
         # --- Overall Node Evaluation ---
         for node_type, scores_tensor in current_node_scores.items():
@@ -784,7 +1292,9 @@ def evaluate_model_inductively(
                  log(f"  Overall Node Metrics ({split_name}, {node_type}): AUROC={node_metrics.get('AUROC', 0):.3f}, AP={node_metrics.get('AP', 0):.3f}")
 
                  # --- Per Anomaly Type Node Analysis ---
-                 node_type_tracking = current_tracking.get(node_type, {})
+                 node_current_tracking = current_tracking.get('node', {})
+                 node_type_tracking = node_current_tracking.get(node_type, {})
+                 #print("Debug 2", node_type_tracking)
                  if node_type_tracking: # Proceed only if tracking info exists
                      anomalous_indices = np.where(labels_np == 1)[0]
                      scores_by_tag = defaultdict(list)
@@ -836,7 +1346,7 @@ def evaluate_model_inductively(
              edge_type_tuple = eval(edge_type) if isinstance(edge_type, str) and '(' in edge_type else edge_type
              if edge_type_tuple in current_gt_edges:
                   labels_np = current_gt_edges[edge_type_tuple].cpu().numpy()
-                  edge_metrics = compute_evaluation_metrics(scores_np, labels_np, k_list=[])
+                  edge_metrics = compute_evaluation_metrics(scores_np, labels_np, k_list=k_list)
                   split_results['edges'][str(edge_type_tuple)] = edge_metrics
                   log(f"  Overall Edge Metrics ({split_name}, {edge_type_tuple}): AUROC={edge_metrics.get('AUROC', 0):.3f}, AP={edge_metrics.get('AP', 0):.3f}")
              else: log(f"  Skipping Edge Eval ({split_name}, {edge_type_tuple}): GT Labels Missing")
@@ -860,14 +1370,16 @@ def evaluate_model_inductively(
                 row = {'Split': split_name, 'Element': f'Node ({node_type})', 'Num Items': num_items, 'Num Anomalies': num_anomalies, '% Anomalies': perc}
                 row.update(metrics); summary_data.append(row)
         for edge_type_str, metrics in results_data.get('edges', {}).items():
-             try: edge_type = eval(edge_type_str)
-             except: edge_type = edge_type_str
-             if metrics and edge_type in current_graph.edge_types:
+            try: edge_type = eval(edge_type_str)
+            except: edge_type = edge_type_str
+            if metrics and edge_type in current_graph.edge_types:
                 num_items = current_graph[edge_type].num_edges
                 num_anomalies = int(current_gt_edges.get(edge_type, torch.tensor([])).sum().item())
                 perc = (num_anomalies / num_items * 100) if num_items > 0 else 0
                 row = {'Split': split_name, 'Element': f'Edge {edge_type_str}', 'Num Items': num_items, 'Num Anomalies': num_anomalies, '% Anomalies': perc}
                 row.update(metrics); summary_data.append(row)
+
+    
 
     summary_df = pd.DataFrame(summary_data)
     ordered_cols = ['Split', 'Element', 'Num Items', 'Num Anomalies', '% Anomalies',
@@ -884,10 +1396,16 @@ def evaluate_model_inductively(
         log("\n--- Generating Plots ---")
         try:
             plot_metric_comparison_bars(summary_df)
-            plot_pr_curves_split(all_scores, gt_node_labels, split_name='test')
-            plot_score_distributions_split(all_scores, gt_node_labels, split_name='test')
+            plot_pr_curves_split(all_scores, gt_node_labels, gt_edge_labels, # Pass both label dicts
+                                 split_name='test', target_edge_type=target_edge_type)
+            log("  Generating all Score Distributions (All Sets)...")
+            plot_all_score_distributions(all_scores, gt_node_labels, gt_edge_labels, # Pass both label dicts
+                                            target_edge_type=target_edge_type)
+            log("  Generating grouped Score Distributions (All Sets)...")
+            plot_grouped_score_distributions(all_scores, gt_node_labels, gt_edge_labels, # Pass both label dicts
+                                            target_edge_type=target_edge_type)
             # Plot new anomaly type comparison for test set
-            plot_anomaly_type_metrics(anomaly_type_df, split_name='test')
+            plot_anomaly_type_metrics_sorted(anomaly_type_df, split_name='test')
 
         except Exception as e:
             log(f"An error occurred during plotting: {e}")

@@ -286,3 +286,314 @@ def visualize_graph_with_anomaly_info(
     net.save_graph(filename)
 
     return net
+
+
+import torch
+import random
+import numpy as np
+import pandas as pd
+from torch_geometric.data import HeteroData
+from pyvis.network import Network
+from collections import defaultdict
+from typing import Tuple, List, Dict, Optional, Set, Any
+
+# Assuming the helper function _parse_scenario_tags is available from the previous step
+def _parse_scenario_tags(tags: List[str]) -> List[str]:
+    """Helper to extract base scenario names from tracking tags."""
+    base_scenarios = set()
+    for tag in tags:
+        if tag == "Combined":
+            continue
+        if '/' in tag: tag = tag.split('/', 1)[1]
+        if tag.endswith("_target"): tag = tag[:-7]
+        elif tag.endswith("_partner"): tag = tag[:-8]
+        base_scenarios.add(tag)
+    return sorted(list(base_scenarios))
+
+def visualize_anomaly_sample(
+    graph: HeteroData,
+    gt_node_labels: Dict[str, torch.Tensor],
+    gt_edge_labels_dict: Dict[Tuple, torch.Tensor],
+    anomaly_tracking: Dict[str, Dict],
+    num_instances_per_scenario: int = 2,
+    num_normal_nodes_per_type: int = 20, # << INCREASED DEFAULT
+    neighborhood_hops: int = 1,
+    provider_node_type: str = 'provider',
+    member_node_type: str = 'member',
+    target_edge_type: Tuple = ('provider', 'to', 'member'),
+    output_filename: str = "anomaly_sample_visualization.html",
+    show_buttons: bool = True,
+    notebook: bool = False,
+    height: str = "800px",
+    width: str = "100%"
+    ) -> None:
+    """
+    Visualizes a sample of the graph highlighting injected anomalies using Pyvis,
+    with distinct shapes for provider/member nodes, including full structural
+    anomaly groups, and more normal nodes.
+
+    Args:
+        graph (HeteroData): The potentially modified graph data.
+        gt_node_labels (Dict[str, Tensor]): Ground truth node labels.
+        gt_edge_labels_dict (Dict[Tuple, Tensor]): Ground truth edge labels.
+        anomaly_tracking (Dict[str, Dict]): Detailed anomaly tracking info.
+        num_instances_per_scenario (int): Max structural *instances* or attribute
+                                          *nodes* per scenario to seed the sample.
+        num_normal_nodes_per_type (int): Number of normal nodes of each type.
+        neighborhood_hops (int): Hops to expand around the initial sample.
+        provider_node_type (str): The exact name used for provider nodes.
+        member_node_type (str): The exact name used for member nodes.
+        target_edge_type (Tuple): Primary edge type.
+        output_filename (str): Output HTML file name.
+        show_buttons (bool): Show Pyvis physics/filter buttons.
+        notebook (bool): True if rendering directly in a Jupyter notebook.
+        height (str): Height of the visualization canvas.
+        width (str): Width of the visualization canvas.
+    """
+    print(f"Generating anomaly visualization (k={neighborhood_hops})...")
+
+    # --- 1. Identify Anomalous Nodes per Scenario ---
+    scenario_nodes = defaultdict(list) # {scenario_name: [(ntype, idx), ...]}
+    node_types_present = list(graph.node_types)
+    if provider_node_type not in node_types_present: print(f"Warning: provider_node_type '{provider_node_type}' not found.")
+    if member_node_type not in node_types_present: print(f"Warning: member_node_type '{member_node_type}' not found.")
+    device = next(iter(gt_node_labels.values())).device
+
+    if 'node' in anomaly_tracking:
+        for ntype, nodes in anomaly_tracking['node'].items():
+             if ntype not in gt_node_labels: continue
+             labels = gt_node_labels[ntype]
+             for idx, tags in nodes.items():
+                 if idx < len(labels) and labels[idx] == 1:
+                     base_scenarios = _parse_scenario_tags(tags)
+                     for sc in base_scenarios:
+                         scenario_nodes[sc].append((ntype, idx))
+
+    # Identify multi-node structural scenarios (adjust names if needed)
+    multi_node_structural_scenarios = {'collusion_ring', 'over_referral_clique', 'member_clique'}
+
+    # --- 2. Select Core Nodes for Visualization ---
+    core_nodes_to_visualize: Set[Tuple[str, int]] = set()
+    sampled_structural_nodes = set() # Track nodes sampled as part of structural groups
+
+    # Sample anomalous nodes/instances per scenario
+    print(f"  Sampling up to {num_instances_per_scenario} instances/nodes per scenario:")
+    sorted_scenarios = sorted(scenario_nodes.keys()) # Process consistently
+    for scenario in sorted_scenarios:
+        nodes = scenario_nodes[scenario]
+        is_multi_node_struct = scenario in multi_node_structural_scenarios
+
+        sampled_count = 0
+        sampled_nodes_for_this_scenario = set()
+        
+        # Shuffle nodes to get random instances if sampling less than available
+        random.shuffle(nodes)
+
+        for ntype, idx in nodes:
+            node_tuple = (ntype, idx)
+            
+            # If it's multi-node, check if we've already included this node via another sampled instance
+            if is_multi_node_struct and node_tuple in sampled_structural_nodes:
+                continue
+                
+            # If not multi-node, just check if we reached the limit for this scenario
+            if not is_multi_node_struct and sampled_count >= num_instances_per_scenario:
+                continue
+
+            # Add the sampled node
+            sampled_nodes_for_this_scenario.add(node_tuple)
+            sampled_count += 1
+
+            # If it's a multi-node structural scenario, find and add ALL nodes associated with this scenario tag
+            # (This assumes all nodes tagged with the same structural scenario name belong to the same 'conceptual' instance for visualization purposes,
+            # which might group multiple small injected instances together visually if num_instances_per_scenario > 1)
+            if is_multi_node_struct:
+                print(f"    - Structural Scenario '{scenario}': Including all nodes for instance containing {node_tuple}.")
+                all_instance_nodes = scenario_nodes[scenario] # Get all nodes originally tagged
+                sampled_nodes_for_this_scenario.update(all_instance_nodes)
+                sampled_structural_nodes.update(all_instance_nodes) # Mark them all as processed
+                # Stop sampling more instances for this *specific* scenario once one instance is fully added
+                # Or adjust if you want exactly num_instances_per_scenario distinct *components*
+                break # Break inner loop once one full structural instance component is added
+
+            # If it's an attribute scenario, stop if limit reached
+            if not is_multi_node_struct and sampled_count >= num_instances_per_scenario:
+                 break
+
+
+        if sampled_nodes_for_this_scenario:
+            core_nodes_to_visualize.update(sampled_nodes_for_this_scenario)
+            print(f"    - {scenario}: Added {len(sampled_nodes_for_this_scenario)} nodes (including full structural instances if applicable).")
+
+
+    # Sample normal nodes (Increased default)
+    print(f"  Sampling up to {num_normal_nodes_per_type} normal nodes per type:")
+    for ntype in node_types_present:
+        if ntype in gt_node_labels:
+            labels = gt_node_labels[ntype]
+            normal_indices = torch.where(labels == 0)[0].tolist()
+            num_to_sample = min(num_normal_nodes_per_type, len(normal_indices))
+            if num_to_sample > 0:
+                sampled_indices = random.sample(normal_indices, num_to_sample)
+                core_nodes_to_visualize.update([(ntype, idx) for idx in sampled_indices])
+                print(f"    - {ntype}: Sampled {len(sampled_indices)} normal nodes.")
+
+    print(f"  Initial core sample size: {len(core_nodes_to_visualize)} nodes.")
+
+    # --- 3. Expand Neighborhood ---
+    # (Neighborhood expansion logic remains the same)
+    print(f"  Expanding neighborhood by {neighborhood_hops} hops...")
+    all_nodes_to_visualize = core_nodes_to_visualize.copy()
+    current_frontier = core_nodes_to_visualize.copy()
+
+    for hop in range(neighborhood_hops):
+        new_neighbors = set()
+        print(f"    Hop {hop + 1}: Frontier size = {len(current_frontier)}")
+        node_indices_by_type = defaultdict(list)
+        for ntype, idx in current_frontier:
+            node_indices_by_type[ntype].append(idx)
+
+        for etype in graph.edge_types:
+            if etype not in graph.edge_types: continue
+            src_type, _, dst_type = etype
+            edge_index = graph[etype].edge_index.to('cpu')
+
+            if src_type in node_indices_by_type and len(node_indices_by_type[src_type]) > 0:
+                 src_nodes_tensor = torch.tensor(node_indices_by_type[src_type], dtype=torch.long)
+                 mask_src = torch.isin(edge_index[0], src_nodes_tensor)
+                 dst_neighbors = edge_index[1, mask_src].tolist()
+                 new_neighbors.update([(dst_type, n_idx) for n_idx in dst_neighbors])
+
+            if dst_type in node_indices_by_type and len(node_indices_by_type[dst_type]) > 0:
+                 dst_nodes_tensor = torch.tensor(node_indices_by_type[dst_type], dtype=torch.long)
+                 mask_dst = torch.isin(edge_index[1], dst_nodes_tensor)
+                 src_neighbors = edge_index[0, mask_dst].tolist()
+                 new_neighbors.update([(src_type, n_idx) for n_idx in src_neighbors])
+
+        current_frontier = new_neighbors - all_nodes_to_visualize
+        all_nodes_to_visualize.update(new_neighbors)
+        if not current_frontier:
+             print(f"    No new neighbors found at hop {hop + 1}. Stopping expansion.")
+             break
+
+    print(f"  Final node sample size after expansion: {len(all_nodes_to_visualize)} nodes.")
+
+    # --- 4. Identify Edges within the Sample ---
+    # (Edge identification logic remains the same)
+    edges_to_visualize = {}
+    print("  Identifying edges within the node sample...")
+    for etype in graph.edge_types:
+        if etype not in graph.edge_types: continue
+        src_type, _, dst_type = etype
+        edge_index = graph[etype].edge_index.to('cpu')
+        num_edges_etype = edge_index.shape[1]
+
+        for i in range(num_edges_etype):
+             u, v = edge_index[0, i].item(), edge_index[1, i].item()
+             u_node = (src_type, u)
+             v_node = (dst_type, v)
+             if u_node in all_nodes_to_visualize and v_node in all_nodes_to_visualize:
+                 edges_to_visualize[(etype, i)] = {'u': u_node, 'v': v_node}
+    print(f"  Found {len(edges_to_visualize)} edges within the sample.")
+
+    # --- 5. Create Pyvis Network ---
+    net = Network(height=height, width=width, notebook=notebook, heading='Anomaly Sample Visualization', directed=True)
+
+    # Define node properties
+    NODE_COLORS = {provider_node_type: "#DC143C", member_node_type: "#1E90FF"} # Crimson Red, Dodger Blue
+    NODE_SHAPES = {provider_node_type: "square", member_node_type: "dot"}
+    DEFAULT_NODE_COLOR = "#C0C0C0"
+    DEFAULT_NODE_SHAPE = "ellipse"
+    ANOMALOUS_BORDER_COLOR = "#FFD700" # Gold border for anomalous
+    NORMAL_BORDER_COLOR = "#666666" # Darker grey border for normal
+    NODE_SIZE_NORMAL = 15
+    NODE_SIZE_ANOMALOUS = 25
+
+    # Edge colors
+    EDGE_COLOR_NORMAL = "#CCCCCC" # Light grey
+    EDGE_COLOR_ANOMALOUS = "#FF4500" # OrangeRed
+
+    added_node_ids = set()
+    node_id_map = {}
+
+    # --- 6. Add Nodes to Pyvis ---
+    print("  Adding nodes to visualization...")
+    for ntype, idx in all_nodes_to_visualize:
+        node_pyvis_id = f"{ntype}_{idx}"
+        if node_pyvis_id in added_node_ids: continue
+
+        is_anomalous = bool(ntype in gt_node_labels and idx < len(gt_node_labels[ntype]) and gt_node_labels[ntype][idx] == 1)
+        node_color = NODE_COLORS.get(ntype, DEFAULT_NODE_COLOR)
+        node_shape = NODE_SHAPES.get(ntype, DEFAULT_NODE_SHAPE)
+        node_size = NODE_SIZE_ANOMALOUS if is_anomalous else NODE_SIZE_NORMAL
+        border_color = ANOMALOUS_BORDER_COLOR if is_anomalous else NORMAL_BORDER_COLOR
+
+        # Construct label and title
+        label_parts = [node_pyvis_id]
+        title_parts = [f"ID: {node_pyvis_id}"]
+        if is_anomalous:
+            #label_parts.append("!") # Indicator
+            title_parts.append("Status: Anomalous")
+            if 'node' in anomaly_tracking and ntype in anomaly_tracking['node'] and idx in anomaly_tracking['node'][ntype]:
+                tags = anomaly_tracking['node'][ntype][idx]
+                scenarios = _parse_scenario_tags(tags)
+                types = set()
+                if "Combined" in tags: types.add("Combined")
+                if any(t.startswith("Structural/") for t in tags): types.add("Structural")
+                if any(t.startswith("Attribute/") for t in tags): types.add("Attribute")
+                type_str = "/".join(sorted(list(types))) if types else "Unknown"
+                scenario_str = ", ".join(scenarios)
+                #label_parts.append(f"({type_str[:3]})")
+                title_parts.append(f"Type: {type_str}")
+                title_parts.append(f"Scenarios: {scenario_str}")
+            else:
+                title_parts.append("Type: Unknown (Not in tracking)")
+        else:
+            title_parts.append("Status: Normal")
+
+        final_label = " ".join(label_parts)
+        final_title = "\n".join(title_parts)
+
+        net.add_node(node_pyvis_id, label=final_label, title=final_title,
+                       color=node_color, # Base color shows type
+                       borderWidth=3 if is_anomalous else 1.5, # Thicker border if anomalous
+                       borderColor=border_color, # Border color shows status
+                       shape=node_shape,
+                       size=node_size
+                       )
+        added_node_ids.add(node_pyvis_id)
+        node_id_map[(ntype, idx)] = node_pyvis_id
+
+    # --- 7. Add Edges to Pyvis ---
+    print("  Adding edges to visualization...")
+    for (etype, edge_idx), edge_info in edges_to_visualize.items():
+        u_node, v_node = edge_info['u'], edge_info['v']
+        u_id, v_id = node_id_map.get(u_node), node_id_map.get(v_node)
+
+        if u_id and v_id:
+            is_anomalous = bool(etype in gt_edge_labels_dict and edge_idx < len(gt_edge_labels_dict[etype]) and gt_edge_labels_dict[etype][edge_idx] == 1)
+            edge_color = EDGE_COLOR_ANOMALOUS if is_anomalous else EDGE_COLOR_NORMAL
+            edge_width = 2.5 if is_anomalous else 1
+            edge_title = f"Type: {etype}\nIndex: {edge_idx}\nStatus: {'Anomalous' if is_anomalous else 'Normal'}"
+            if hasattr(graph[etype], 'edge_attr') and graph[etype].edge_attr is not None:
+                 attrs = graph[etype].edge_attr[edge_idx].tolist()
+                 if len(attrs) < 5: edge_title += f"\nAttrs: {attrs}"
+
+            net.add_edge(u_id, v_id, title=edge_title, color=edge_color, width=edge_width)
+
+    # --- 8. Configure and Save/Show ---
+    if show_buttons:
+        net.show_buttons(filter_=['physics', 'nodes', 'edges'])
+
+    try:
+        if notebook:
+            net.show(output_filename)
+            print(f"Visualization displayed in notebook (also saved to {output_filename})")
+        else:
+            net.save_graph(output_filename)
+            print(f"Visualization saved to {output_filename}")
+    except Exception as e:
+         print(f"Error during Pyvis generation/saving: {e}")
+         print("Try installing requirements: pip install pyvis pandas")
+
+
